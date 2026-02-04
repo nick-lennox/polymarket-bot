@@ -106,7 +106,8 @@ class PolymarketClient:
             funder=self.config.funder_address,
         )
 
-        self._api_creds = self._client.derive_api_creds()
+        # Use create_or_derive_api_creds (newer API)
+        self._api_creds = self._client.create_or_derive_api_creds()
         self._client.set_api_creds(self._api_creds)
 
         logger.info("Successfully connected to Polymarket")
