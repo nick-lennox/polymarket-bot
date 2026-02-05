@@ -23,6 +23,8 @@ DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.5",
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "Pragma": "no-cache",
 }
 
 
@@ -79,8 +81,12 @@ class TSAScraper:
     async def fetch_page(self) -> str:
         if not self._client:
             raise RuntimeError("Scraper must be used as async context manager")
-        logger.debug(f"Fetching {TSA_URL}")
-        response = await self._client.get(TSA_URL)
+        # Cache-bust with timestamp to bypass CDN/Akamai 10-min TTL
+        import time
+        cache_buster = int(time.time() * 1000)
+        url = f"{TSA_URL}?_={cache_buster}"
+        logger.debug(f"Fetching {url}")
+        response = await self._client.get(url)
         response.raise_for_status()
         return response.text
 
