@@ -131,10 +131,16 @@ async def run_simulation():
                         spread_str = f"spread={book.spread:.4f}" if book.spread else ""
                         bid_depth = sum(l.size for l in book.bids)
                         ask_depth = sum(l.size for l in book.asks)
-                        print(f"     {outcome.outcome:12s}  {bid_str}  {ask_str}  {spread_str}")
+                        print(f"     {outcome.outcome:12s}  YES: {bid_str}  {ask_str}  {spread_str}")
                         print(f"                   bid_depth={bid_depth:.0f}  ask_depth={ask_depth:.0f}")
                     else:
-                        print(f"     {outcome.outcome:12s}  [no order book]")
+                        print(f"     {outcome.outcome:12s}  YES: [no order book]")
+
+                    no_book = outcome.no_order_book
+                    if no_book:
+                        no_bid = f"bid={no_book.best_bid:.4f}" if no_book.best_bid else "bid=none"
+                        no_ask = f"ask={no_book.best_ask:.4f}" if no_book.best_ask else "ask=none"
+                        print(f"                   NO:  {no_bid}  {no_ask}")
             else:
                 errors.append(f"Market not found: {market_slug}")
         except Exception as e:
@@ -158,6 +164,12 @@ async def run_simulation():
             for signal in decision.signals:
                 if signal.action == "BUY_YES":
                     print(f"     >>> WOULD BUY YES on '{signal.outcome.outcome}'")
+                    print(f"         Price: {signal.target_price:.4f}")
+                    print(f"         Size: ${signal.size_usd:.2f}")
+                    print(f"         Edge: {signal.edge:.1%}")
+                    print(f"         Reason: {signal.reason}")
+                elif signal.action == "BUY_NO":
+                    print(f"     >>> WOULD BUY NO on '{signal.outcome.outcome}'")
                     print(f"         Price: {signal.target_price:.4f}")
                     print(f"         Size: ${signal.size_usd:.2f}")
                     print(f"         Edge: {signal.edge:.1%}")

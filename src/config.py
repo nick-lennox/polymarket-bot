@@ -13,6 +13,7 @@ class TradingConfig(BaseModel):
     max_trade_size_usd: float = Field(default=50.0, ge=0.0)
     max_buy_price: float = Field(default=0.95, ge=0.0, le=1.0)
     min_edge: float = Field(default=0.05, ge=0.0, le=1.0)
+    max_total_per_cycle_usd: float = Field(default=100.0, ge=0.0)
     dry_run: bool = Field(default=True)
 
 
@@ -47,6 +48,7 @@ class Settings(BaseSettings):
     max_trade_size_usd: float = Field(default=50.0, alias="MAX_TRADE_SIZE_USD")
     max_buy_price: float = Field(default=0.95, alias="MAX_BUY_PRICE")
     min_edge: float = Field(default=0.05, alias="MIN_EDGE")
+    max_total_per_cycle_usd: float = Field(default=100.0, alias="MAX_TOTAL_PER_CYCLE_USD")
     dry_run: bool = Field(default=True, alias="DRY_RUN")
     poll_interval_seconds: int = Field(default=30, alias="POLL_INTERVAL_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
@@ -61,6 +63,7 @@ class Settings(BaseSettings):
             max_trade_size_usd=self.max_trade_size_usd,
             max_buy_price=self.max_buy_price,
             min_edge=self.min_edge,
+            max_total_per_cycle_usd=self.max_total_per_cycle_usd,
             dry_run=self.dry_run,
         )
 
@@ -94,6 +97,7 @@ def print_config(settings: Settings, hide_secrets: bool = True):
     print(f"Target Market: {settings.target_market_slug or '(not set)'}")
     print()
     print(f"Max Trade Size: ${settings.max_trade_size_usd}")
+    print(f"Max Total/Cycle: ${settings.max_total_per_cycle_usd}")
     print(f"Max Buy Price: {settings.max_buy_price}")
     print(f"Min Edge: {settings.min_edge}")
     print(f"Dry Run: {settings.dry_run}")

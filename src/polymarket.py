@@ -68,7 +68,9 @@ class MarketOutcome:
     outcome: str
     condition_id: str = ""
     group_item_title: str = ""
+    no_token_id: str = ""
     order_book: Optional[OrderBook] = None
+    no_order_book: Optional[OrderBook] = None
 
 
 @dataclass
@@ -155,6 +157,7 @@ class PolymarketClient:
                     clob_token_ids = []
 
                 yes_token_id = clob_token_ids[0] if len(clob_token_ids) > 0 else ""
+                no_token_id = clob_token_ids[1] if len(clob_token_ids) > 1 else ""
                 group_title = sm.get("groupItemTitle", "")
                 question = sm.get("question", "")
 
@@ -163,6 +166,7 @@ class PolymarketClient:
                     outcome=group_title or question,
                     condition_id=sm.get("conditionId", ""),
                     group_item_title=group_title,
+                    no_token_id=no_token_id,
                 ))
 
                 price = sm.get("outcomePrices", "")
@@ -215,6 +219,8 @@ class PolymarketClient:
         for outcome in market.outcomes:
             if outcome.token_id:
                 outcome.order_book = self.get_order_book(outcome.token_id)
+            if outcome.no_token_id:
+                outcome.no_order_book = self.get_order_book(outcome.no_token_id)
 
         return market
 

@@ -30,7 +30,7 @@ TSA_BRACKETS = [
 
 @dataclass
 class TradeSignal:
-    action: str  # "BUY_YES", "HOLD"
+    action: str  # "BUY_YES", "BUY_NO", "HOLD"
     outcome: MarketOutcome
     reason: str
     target_price: Optional[float] = None
@@ -98,6 +98,17 @@ class TradingEngine:
                 signals.append(signal)
         else:
             logger.warning("No order book available for correct outcome")
+
+        # Analyze wrong outcomes - BUY NO where stale YES bids create edge
+        for outcome in market.outcomes:
+            if outcome == correct_outcome:
+                continue
+            if not outcome.no_token_id:
+                continue
+            if outcome.no_order_book:
+                signal = self._analyze_wrong_outcome(outcome)
+                if signal:
+                    signals.append(signal)
 
         return TradingDecision(
             tsa_data=tsa_data,
@@ -200,24 +211,72 @@ class TradingEngine:
             edge=edge,
         )
 
+    def _analyze_wrong_outcome(self, outcome: MarketOutcome) -> Optional[TradeSignal]:
+        """Analyze a wrong outcome for NO-buying opportunity.
+
+        If someone has stale YES asks (or equivalently, cheap NO asks),
+        we can buy NO since we know this outcome will resolve to NO.
+        """
+        book = outcome.no_order_book
+        if not book or not book.best_ask:
+            return None
+
+        no_ask_price = book.best_ask
+        fair_value = 1.0  # NO is worth  since this outcome is wrong
+        edge = fair_value - no_ask_price
+
+        logger.info(f"Wrong outcome '{outcome.outcome}': NO best_ask={no_ask_price:.4f}, edge={edge:.4f}")
+
+        if edge < self.config.min_edge:
+            return None  # Silent skip - most wrong brackets won't have edge
+
+        if no_ask_price > self.config.max_buy_price:
+            return None
+
+        available_liquidity = sum(level.size * level.price for level in book.asks)
+        trade_size = min(self.config.max_trade_size_usd, available_liquidity)
+
+        if trade_size < 1.0:
+            return None
+
+        return TradeSignal(
+            action="BUY_NO",
+            outcome=outcome,
+            reason=f"Buy NO on wrong outcome with {edge:.1%} edge",
+            target_price=no_ask_price,
+            size_usd=trade_size,
+            edge=edge,
+        )
+
     def execute_signals(self, signals: list[TradeSignal]) -> list[TradeResult]:
-        """Execute trading signals."""
+        """Execute trading signals, respecting per-cycle budget."""
         results = []
+        cycle_spent = 0.0
+        cycle_budget = self.config.max_total_per_cycle_usd
 
         for signal in signals:
             if signal.action == "HOLD":
                 logger.info(f"HOLD: {signal.outcome.outcome} - {signal.reason}")
                 continue
 
-            if signal.action == "BUY_YES":
+            if signal.action in ("BUY_YES", "BUY_NO"):
+                # Enforce per-cycle budget
+                remaining = cycle_budget - cycle_spent
+                if remaining <= 0:
+                    logger.info(f"Cycle budget exhausted (${cycle_budget:.2f}) - skipping remaining signals")
+                    break
+                trade_amount = min(signal.size_usd, remaining)
+
+                token_id = signal.outcome.token_id if signal.action == "BUY_YES" else signal.outcome.no_token_id
+
                 logger.info(
-                    f"EXECUTING: BUY YES on '{signal.outcome.outcome}' "
-                    f"for ${signal.size_usd:.2f} @ {signal.target_price:.3f}"
+                    f"EXECUTING: {signal.action} on '{signal.outcome.outcome}' "
+                    f"for ${trade_amount:.2f} @ {signal.target_price:.3f}"
                 )
 
                 result = self.client.buy_market_order(
-                    token_id=signal.outcome.token_id,
-                    amount_usd=signal.size_usd,
+                    token_id=token_id,
+                    amount_usd=trade_amount,
                     dry_run=self.config.dry_run,
                 )
 
@@ -225,7 +284,8 @@ class TradingEngine:
                 self._trade_history.append(result)
 
                 if result.success:
-                    logger.info(f"Trade executed: {result.order_id}")
+                    cycle_spent += trade_amount
+                    logger.info(f"Trade executed: {result.order_id} (cycle spent: ${cycle_spent:.2f}/${cycle_budget:.2f})")
                 else:
                     logger.error(f"Trade failed: {result.error}")
 
