@@ -2,13 +2,16 @@
 Polymarket CLOB API Wrapper
 
 Handles connection to Polymarket, reading order books, and executing trades.
+Uses Gamma API for market discovery and CLOB API for order execution.
 """
 
+import json
 import logging
 from dataclasses import dataclass
 from typing import Optional
 from enum import Enum
 
+import httpx
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, OrderType, MarketOrderArgs
 from py_clob_client.order_builder.constants import BUY, SELL
@@ -16,6 +19,8 @@ from py_clob_client.order_builder.constants import BUY, SELL
 from .config import PolymarketConfig
 
 logger = logging.getLogger(__name__)
+
+GAMMA_API_URL = "https://gamma-api.polymarket.com"
 
 
 class Side(str, Enum):
@@ -25,14 +30,12 @@ class Side(str, Enum):
 
 @dataclass
 class OrderBookLevel:
-    """Single price level in the order book."""
     price: float
     size: float
 
 
 @dataclass
 class OrderBook:
-    """Order book for a market outcome."""
     token_id: str
     bids: list[OrderBookLevel]
     asks: list[OrderBookLevel]
@@ -60,23 +63,23 @@ class OrderBook:
 
 @dataclass
 class MarketOutcome:
-    """Represents a single outcome in a market."""
     token_id: str
     outcome: str
+    condition_id: str = ""
+    group_item_title: str = ""
     order_book: Optional[OrderBook] = None
 
 
 @dataclass
 class Market:
-    """Represents a Polymarket market with multiple outcomes."""
     condition_id: str
     question: str
     outcomes: list[MarketOutcome]
+    neg_risk_market_id: str = ""
 
 
 @dataclass
 class TradeResult:
-    """Result of a trade execution."""
     success: bool
     order_id: Optional[str] = None
     filled_size: float = 0.0
@@ -93,9 +96,8 @@ class PolymarketClient:
         self._api_creds = None
 
     def connect(self):
-        """Initialize connection to Polymarket CLOB."""
         if not self.config.private_key:
-            raise ValueError("Private key is required for Polymarket connection")
+            raise ValueError("Private key is required")
 
         logger.info(f"Connecting to Polymarket CLOB at {self.config.api_url}")
 
@@ -106,7 +108,6 @@ class PolymarketClient:
             funder=self.config.funder_address,
         )
 
-        # Use create_or_derive_api_creds (newer API)
         self._api_creds = self._client.create_or_derive_api_creds()
         self._client.set_api_creds(self._api_creds)
 
@@ -118,33 +119,65 @@ class PolymarketClient:
             raise RuntimeError("Not connected. Call connect() first.")
         return self._client
 
-    def get_market(self, condition_id: str) -> Optional[Market]:
-        """Fetch market details by condition ID."""
+    def get_market_by_slug(self, event_slug: str) -> Optional[Market]:
+        """Fetch market details from Gamma API by event slug."""
         try:
-            market_data = self.client.get_market(condition_id)
-            if not market_data:
+            resp = httpx.get(
+                f"{GAMMA_API_URL}/events",
+                params={"slug": event_slug},
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            events = resp.json()
+
+            if not events:
+                logger.error(f"No event found for slug: {event_slug}")
                 return None
 
-            outcomes = []
-            tokens = market_data.get("tokens", [])
+            event = events[0]
+            sub_markets = event.get("markets", [])
+            neg_risk_market_id = event.get("negRiskMarketID", "")
 
-            for token in tokens:
+            logger.info(f"Found event: {event.get('title', '')}")
+            logger.info(f"Neg-risk market ID: {neg_risk_market_id}")
+            logger.info(f"Sub-markets: {len(sub_markets)}")
+
+            outcomes = []
+            for sm in sub_markets:
+                if not sm.get("active", False) and sm.get("groupItemTitle") != "Other":
+                    continue
+
+                clob_token_ids_raw = sm.get("clobTokenIds", "[]")
+                try:
+                    clob_token_ids = json.loads(clob_token_ids_raw)
+                except (json.JSONDecodeError, TypeError):
+                    clob_token_ids = []
+
+                yes_token_id = clob_token_ids[0] if len(clob_token_ids) > 0 else ""
+                group_title = sm.get("groupItemTitle", "")
+                question = sm.get("question", "")
+
                 outcomes.append(MarketOutcome(
-                    token_id=token.get("token_id", ""),
-                    outcome=token.get("outcome", ""),
+                    token_id=yes_token_id,
+                    outcome=group_title or question,
+                    condition_id=sm.get("conditionId", ""),
+                    group_item_title=group_title,
                 ))
 
+                price = sm.get("outcomePrices", "")
+                logger.info(f"  {group_title}: YES_token={yes_token_id[:15]}... price={price}")
+
             return Market(
-                condition_id=condition_id,
-                question=market_data.get("question", ""),
+                condition_id=neg_risk_market_id or event.get("id", ""),
+                question=event.get("title", ""),
                 outcomes=outcomes,
+                neg_risk_market_id=neg_risk_market_id,
             )
         except Exception as e:
-            logger.error(f"Failed to get market {condition_id}: {e}")
+            logger.error(f"Failed to get market by slug {event_slug}: {e}")
             return None
 
     def get_order_book(self, token_id: str) -> Optional[OrderBook]:
-        """Fetch order book for a specific outcome token."""
         try:
             book_data = self.client.get_order_book(token_id)
 
@@ -169,29 +202,24 @@ class PolymarketClient:
 
             return OrderBook(token_id=token_id, bids=bids, asks=asks)
         except Exception as e:
-            logger.error(f"Failed to get order book for {token_id}: {e}")
+            logger.error(f"Failed to get order book for {token_id[:15]}...: {e}")
             return None
 
-    def get_market_with_books(self, condition_id: str) -> Optional[Market]:
-        """Fetch market with order books for all outcomes."""
-        market = self.get_market(condition_id)
+    def get_market_with_books(self, event_slug: str) -> Optional[Market]:
+        """Fetch market via Gamma API with order books for all outcomes."""
+        market = self.get_market_by_slug(event_slug)
         if not market:
             return None
 
         for outcome in market.outcomes:
-            outcome.order_book = self.get_order_book(outcome.token_id)
+            if outcome.token_id:
+                outcome.order_book = self.get_order_book(outcome.token_id)
 
         return market
 
-    def buy_market_order(
-        self,
-        token_id: str,
-        amount_usd: float,
-        dry_run: bool = True,
-    ) -> TradeResult:
-        """Execute a market buy order."""
+    def buy_market_order(self, token_id, amount_usd, dry_run=True):
         if dry_run:
-            logger.info(f"[DRY RUN] Would BUY ${amount_usd} of token {token_id}")
+            logger.info(f"[DRY RUN] Would BUY ${amount_usd} of token {token_id[:15]}...")
             return TradeResult(success=True, order_id="dry-run")
 
         try:
@@ -199,10 +227,8 @@ class PolymarketClient:
                 MarketOrderArgs(token_id=token_id, amount=amount_usd)
             )
             response = self.client.post_order(order, OrderType.FOK)
-
             order_id = response.get("orderID", "")
             logger.info(f"Market buy order submitted: {order_id}")
-
             return TradeResult(
                 success=True,
                 order_id=order_id,
@@ -213,11 +239,9 @@ class PolymarketClient:
             logger.error(f"Market buy failed: {e}")
             return TradeResult(success=False, error=str(e))
 
-    def get_balance(self) -> float:
-        """Get USDC balance."""
+    def get_balance(self):
         try:
-            balance = self.client.get_balance()
-            return float(balance)
+            return float(self.client.get_balance())
         except Exception as e:
             logger.error(f"Failed to get balance: {e}")
             return 0.0

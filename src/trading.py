@@ -4,6 +4,7 @@ Trading Logic Engine
 Determines when and how to trade based on TSA data and market conditions.
 """
 
+import re
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -16,10 +17,20 @@ from .config import TradingConfig
 logger = logging.getLogger(__name__)
 
 
+# Polymarket TSA brackets (200K increments)
+TSA_BRACKETS = [
+    (0, 1.5, "<1.5M"),
+    (1.5, 1.7, "1.5M-1.7M"),
+    (1.7, 1.9, "1.7M-1.9M"),
+    (1.9, 2.1, "1.9M-2.1M"),
+    (2.1, 2.3, "2.1M-2.3M"),
+    (2.3, 99.0, ">2.3M"),
+]
+
+
 @dataclass
 class TradeSignal:
-    """A signal to execute a trade."""
-    action: str  # "BUY_YES", "SELL_NO", "HOLD"
+    action: str  # "BUY_YES", "HOLD"
     outcome: MarketOutcome
     reason: str
     target_price: Optional[float] = None
@@ -29,11 +40,19 @@ class TradeSignal:
 
 @dataclass
 class TradingDecision:
-    """Result of analyzing a market given new TSA data."""
     tsa_data: TSADataPoint
     correct_bracket: str
     signals: list[TradeSignal]
     timestamp: datetime
+
+
+def get_polymarket_bracket(passenger_count: int) -> str:
+    """Map a passenger count to the Polymarket bracket name."""
+    millions = passenger_count / 1_000_000
+    for lower, upper, name in TSA_BRACKETS:
+        if lower <= millions < upper:
+            return name
+    return ">2.3M"
 
 
 class TradingEngine:
@@ -47,7 +66,7 @@ class TradingEngine:
     def analyze_market(self, tsa_data: TSADataPoint, market: Market) -> TradingDecision:
         """Analyze market given new TSA data."""
         signals = []
-        correct_bracket = tsa_data.get_bracket()
+        correct_bracket = get_polymarket_bracket(tsa_data.passenger_count)
 
         logger.info(f"Analyzing market for {tsa_data.date}")
         logger.info(f"Actual count: {tsa_data.formatted_count} ({tsa_data.millions:.3f}M)")
@@ -70,11 +89,15 @@ class TradingEngine:
                 timestamp=datetime.now(),
             )
 
+        logger.info(f"Matched outcome: '{correct_outcome.outcome}' (token: {correct_outcome.token_id[:15]}...)")
+
         # Analyze the correct outcome - BUY YES if cheap
         if correct_outcome.order_book:
             signal = self._analyze_correct_outcome(correct_outcome)
             if signal:
                 signals.append(signal)
+        else:
+            logger.warning("No order book available for correct outcome")
 
         return TradingDecision(
             tsa_data=tsa_data,
@@ -85,19 +108,24 @@ class TradingEngine:
 
     def _brackets_match(self, outcome_name: str, bracket: str) -> bool:
         """Check if an outcome name matches a bracket."""
-        import re
-        outcome_lower = outcome_name.lower().replace(",", "").replace(" ", "")
-        bracket_lower = bracket.lower().replace(",", "").replace(" ", "")
+        # Normalize: remove spaces, lowercase
+        o = outcome_name.lower().replace(" ", "").replace(",", "")
+        b = bracket.lower().replace(" ", "").replace(",", "")
 
-        if bracket_lower in outcome_lower:
+        # Direct match
+        if b == o:
             return True
 
-        bracket_nums = re.findall(r"(\d+\.?\d*)m?", bracket_lower)
-        if len(bracket_nums) >= 2:
-            lower_bound = bracket_nums[0]
-            upper_bound = bracket_nums[1]
-            if lower_bound in outcome_lower and upper_bound in outcome_lower:
-                return True
+        # Handle variations like "<1.5M" vs "<1.5m"
+        if b in o or o in b:
+            return True
+
+        # Extract numbers and compare
+        o_nums = re.findall(r"[\d.]+", o)
+        b_nums = re.findall(r"[\d.]+", b)
+
+        if o_nums and b_nums and o_nums == b_nums:
+            return True
 
         return False
 
@@ -111,10 +139,9 @@ class TradingEngine:
         fair_value = 1.0
         edge = fair_value - ask_price
 
-        logger.info(f"Correct outcome '{outcome.outcome}': ask={ask_price:.3f}, edge={edge:.3f}")
+        logger.info(f"Correct outcome '{outcome.outcome}': best_ask={ask_price:.4f}, edge={edge:.4f}")
 
         if edge < self.config.min_edge:
-            logger.debug(f"Insufficient edge ({edge:.3f} < {self.config.min_edge})")
             return TradeSignal(
                 action="HOLD",
                 outcome=outcome,
@@ -123,7 +150,6 @@ class TradingEngine:
             )
 
         if ask_price > self.config.max_buy_price:
-            logger.debug(f"Price too high ({ask_price:.3f} > {self.config.max_buy_price})")
             return TradeSignal(
                 action="HOLD",
                 outcome=outcome,
@@ -184,23 +210,3 @@ class TradingEngine:
 
     def get_trade_history(self) -> list[TradeResult]:
         return self._trade_history.copy()
-
-
-class BracketMapper:
-    """Maps passenger counts to market outcome brackets."""
-
-    def __init__(self, bracket_size_millions: float = 0.1, brackets=None):
-        self.bracket_size = bracket_size_millions
-        self.explicit_brackets = brackets
-
-    def get_bracket_name(self, passenger_count: int) -> str:
-        millions = passenger_count / 1_000_000
-
-        if self.explicit_brackets:
-            for lower, upper, name in self.explicit_brackets:
-                if lower <= millions < upper:
-                    return name
-
-        lower = int(millions / self.bracket_size) * self.bracket_size
-        upper = lower + self.bracket_size
-        return f"{lower:.1f}M - {upper:.1f}M"
