@@ -61,13 +61,28 @@ class TradingBot:
         else:
             logger.warning("No Polymarket credentials - running in monitor-only mode")
 
-    async def run(self):
-        """Main bot loop."""
-        self._running = True
-        poll_interval = self.settings.poll_interval_seconds
+    def _get_poll_interval(self) -> int:
+        """Return poll interval based on time of day.
 
-        logger.info(f"Starting monitoring loop (poll interval: {poll_interval}s)")
-        logger.info(f"Target market: {self.settings.target_market_slug or '(not set)'}")
+        Hot window (8:00-14:30 ET weekdays): poll every 5 seconds
+        Outside hot window: use configured POLL_INTERVAL_SECONDS
+        """
+        now_et = datetime.now(ET_TIMEZONE)
+        is_weekday = now_et.weekday() < 5
+        in_hot_window = time(8, 0) <= now_et.time() <= time(14, 30)
+
+        if is_weekday and in_hot_window:
+            return 5
+        return self.settings.poll_interval_seconds
+
+    async def run(self):
+        """Main bot loop with dynamic polling."""
+        self._running = True
+
+        logger.info(f"Starting monitoring loop")
+        logger.info(f"  Default poll interval: {self.settings.poll_interval_seconds}s")
+        logger.info(f"  Hot window (8:00-14:30 ET weekdays): 5s")
+        logger.info(f"Target market: {self.settings.target_market_slug or '(auto-discover)'}")
         logger.info(f"Dry run mode: {self.settings.dry_run}")
 
         async with self.scraper:
@@ -82,23 +97,21 @@ class TradingBot:
             else:
                 logger.warning("Could not fetch initial TSA data")
 
+            last_logged_interval = None
             while self._running:
                 try:
                     await self._check_and_trade()
                 except Exception as e:
                     logger.error(f"Error in main loop: {e}", exc_info=True)
 
-                await asyncio.sleep(poll_interval)
+                interval = self._get_poll_interval()
+                if interval != last_logged_interval:
+                    logger.info(f"Poll interval: {interval}s")
+                    last_logged_interval = interval
+                await asyncio.sleep(interval)
 
     async def _check_and_trade(self):
         """Check for new data and execute trades if appropriate."""
-        now_et = datetime.now(ET_TIMEZONE)
-        is_weekday = now_et.weekday() < 5
-        is_update_window = time(8, 30) <= now_et.time() <= time(10, 0)
-
-        if is_update_window and is_weekday:
-            logger.debug("In TSA update window - checking more carefully")
-
         new_data = await self.scraper.check_for_new_data()
 
         if not new_data:
