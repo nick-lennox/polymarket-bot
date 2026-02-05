@@ -101,6 +101,16 @@ async def run_simulation():
     else:
         errors.append("No private key - cannot test Polymarket connection")
 
+    # STEP 3b: Auto-Discovery Test
+    # Always test auto-discovery regardless of TARGET_MARKET_SLUG setting
+    if poly_client and tsa_data:
+        print_section("STEP 3b: Auto-Discovery Test")
+        test_slug = poly_client.discover_tsa_market(tsa_data.date)
+        if test_slug:
+            print(f"[OK] Auto-discovery works: {test_slug}")
+        else:
+            errors.append(f"Auto-discovery FAILED for {tsa_data.date} - this must work for live trading without TARGET_MARKET_SLUG")
+
     # STEP 4: Market Discovery
     print_section("STEP 4: Market Discovery")
     market = None
