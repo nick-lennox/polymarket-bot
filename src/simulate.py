@@ -168,6 +168,7 @@ async def run_simulation():
         if actionable:
             budget = trading_config.max_trade_size_usd
             sim_spent = 0.0
+            sim_profit = 0.0
             print(f"     Budget: ${budget:.2f}")
             print()
             for signal in actionable:
@@ -177,12 +178,20 @@ async def run_simulation():
                     continue
                 alloc = min(signal.size_usd, remaining)
                 sim_spent += alloc
+                # Profit = payout - cost. Each token pays $1, cost is target_price per token.
+                # Shares bought = alloc / target_price. Payout = shares * $1.
+                shares = alloc / signal.target_price
+                payout = shares * 1.0
+                profit = payout - alloc
+                sim_profit += profit
                 print(f"     >>> WOULD {signal.action} on '{signal.outcome.outcome}'")
                 print(f"         Price: {signal.target_price:.4f}")
                 print(f"         Spend: ${alloc:.2f}  (liquidity: ${signal.size_usd:.2f})")
                 print(f"         Edge: {signal.edge:.1%}")
+                print(f"         Profit: ${profit:.2f}  (${alloc:.2f} -> ${payout:.2f})")
             print()
             print(f"     Total would spend: ${sim_spent:.2f} / ${budget:.2f}")
+            print(f"     Projected profit:  ${sim_profit:.2f}  ({sim_profit/sim_spent*100:.1f}% return)" if sim_spent > 0 else "")
 
         for signal in holds:
             print(f"     --- HOLD on '{signal.outcome.outcome}'")
