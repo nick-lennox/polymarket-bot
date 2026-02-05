@@ -192,9 +192,8 @@ class TradingEngine:
             )
 
         available_liquidity = sum(level.size * level.price for level in book.asks)
-        trade_size = min(self.config.max_trade_size_usd, available_liquidity)
 
-        if trade_size < 1.0:
+        if available_liquidity < 1.0:
             return TradeSignal(
                 action="HOLD",
                 outcome=outcome,
@@ -207,7 +206,7 @@ class TradingEngine:
             outcome=outcome,
             reason=f"Buy correct outcome with {edge:.1%} edge",
             target_price=ask_price,
-            size_usd=trade_size,
+            size_usd=available_liquidity,
             edge=edge,
         )
 
@@ -234,9 +233,8 @@ class TradingEngine:
             return None
 
         available_liquidity = sum(level.size * level.price for level in book.asks)
-        trade_size = min(self.config.max_trade_size_usd, available_liquidity)
 
-        if trade_size < 1.0:
+        if available_liquidity < 1.0:
             return None
 
         return TradeSignal(
@@ -244,50 +242,64 @@ class TradingEngine:
             outcome=outcome,
             reason=f"Buy NO on wrong outcome with {edge:.1%} edge",
             target_price=no_ask_price,
-            size_usd=trade_size,
+            size_usd=available_liquidity,
             edge=edge,
         )
 
     def execute_signals(self, signals: list[TradeSignal]) -> list[TradeResult]:
-        """Execute trading signals, respecting per-cycle budget."""
-        results = []
-        cycle_spent = 0.0
-        cycle_budget = self.config.max_total_per_cycle_usd
+        """Execute trading signals, ranked by edge, from a single budget.
 
+        Sorts all actionable signals by edge (best first), then allocates
+        from MAX_TRADE_SIZE_USD until the budget is exhausted.
+        """
+        results = []
+        budget = self.config.max_trade_size_usd
+        spent = 0.0
+
+        # Log HOLDs, collect actionable signals
+        actionable = []
         for signal in signals:
             if signal.action == "HOLD":
                 logger.info(f"HOLD: {signal.outcome.outcome} - {signal.reason}")
-                continue
+            else:
+                actionable.append(signal)
 
-            if signal.action in ("BUY_YES", "BUY_NO"):
-                # Enforce per-cycle budget
-                remaining = cycle_budget - cycle_spent
-                if remaining <= 0:
-                    logger.info(f"Cycle budget exhausted (${cycle_budget:.2f}) - skipping remaining signals")
-                    break
-                trade_amount = min(signal.size_usd, remaining)
+        # Sort by edge descending - best opportunities first
+        actionable.sort(key=lambda s: s.edge, reverse=True)
 
-                token_id = signal.outcome.token_id if signal.action == "BUY_YES" else signal.outcome.no_token_id
+        if actionable:
+            logger.info(f"Ranked {len(actionable)} opportunities by edge (budget: ${budget:.2f}):")
+            for i, s in enumerate(actionable):
+                logger.info(f"  {i+1}. {s.action} '{s.outcome.outcome}' edge={s.edge:.1%} liquidity=${s.size_usd:.2f}")
 
-                logger.info(
-                    f"EXECUTING: {signal.action} on '{signal.outcome.outcome}' "
-                    f"for ${trade_amount:.2f} @ {signal.target_price:.3f}"
-                )
+        for signal in actionable:
+            remaining = budget - spent
+            if remaining < 1.0:
+                logger.info(f"Budget exhausted (${spent:.2f}/${budget:.2f}) - skipping remaining")
+                break
 
-                result = self.client.buy_market_order(
-                    token_id=token_id,
-                    amount_usd=trade_amount,
-                    dry_run=self.config.dry_run,
-                )
+            trade_amount = min(signal.size_usd, remaining)
+            token_id = signal.outcome.token_id if signal.action == "BUY_YES" else signal.outcome.no_token_id
 
-                results.append(result)
-                self._trade_history.append(result)
+            logger.info(
+                f"EXECUTING: {signal.action} on '{signal.outcome.outcome}' "
+                f"for ${trade_amount:.2f} @ {signal.target_price:.3f} (edge: {signal.edge:.1%})"
+            )
 
-                if result.success:
-                    cycle_spent += trade_amount
-                    logger.info(f"Trade executed: {result.order_id} (cycle spent: ${cycle_spent:.2f}/${cycle_budget:.2f})")
-                else:
-                    logger.error(f"Trade failed: {result.error}")
+            result = self.client.buy_market_order(
+                token_id=token_id,
+                amount_usd=trade_amount,
+                dry_run=self.config.dry_run,
+            )
+
+            results.append(result)
+            self._trade_history.append(result)
+
+            if result.success:
+                spent += trade_amount
+                logger.info(f"Trade executed: {result.order_id} (spent: ${spent:.2f}/${budget:.2f})")
+            else:
+                logger.error(f"Trade failed: {result.error}")
 
         return results
 
