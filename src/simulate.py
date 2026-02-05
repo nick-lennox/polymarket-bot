@@ -160,24 +160,35 @@ async def run_simulation():
         print(f"     Signals generated: {len(decision.signals)}")
         print()
 
-        if decision.signals:
-            for signal in decision.signals:
-                if signal.action == "BUY_YES":
-                    print(f"     >>> WOULD BUY YES on '{signal.outcome.outcome}'")
-                    print(f"         Price: {signal.target_price:.4f}")
-                    print(f"         Size: ${signal.size_usd:.2f}")
-                    print(f"         Edge: {signal.edge:.1%}")
-                    print(f"         Reason: {signal.reason}")
-                elif signal.action == "BUY_NO":
-                    print(f"     >>> WOULD BUY NO on '{signal.outcome.outcome}'")
-                    print(f"         Price: {signal.target_price:.4f}")
-                    print(f"         Size: ${signal.size_usd:.2f}")
-                    print(f"         Edge: {signal.edge:.1%}")
-                    print(f"         Reason: {signal.reason}")
-                elif signal.action == "HOLD":
-                    print(f"     --- HOLD on '{signal.outcome.outcome}'")
-                    print(f"         Reason: {signal.reason}")
-        else:
+        # Separate HOLDs from actionable signals, rank by edge
+        holds = [s for s in decision.signals if s.action == "HOLD"]
+        actionable = [s for s in decision.signals if s.action != "HOLD"]
+        actionable.sort(key=lambda s: s.edge, reverse=True)
+
+        if actionable:
+            budget = trading_config.max_trade_size_usd
+            sim_spent = 0.0
+            print(f"     Budget: ${budget:.2f}")
+            print()
+            for signal in actionable:
+                remaining = budget - sim_spent
+                if remaining < 1.0:
+                    print(f"     --- SKIP '{signal.outcome.outcome}' (budget exhausted)")
+                    continue
+                alloc = min(signal.size_usd, remaining)
+                sim_spent += alloc
+                print(f"     >>> WOULD {signal.action} on '{signal.outcome.outcome}'")
+                print(f"         Price: {signal.target_price:.4f}")
+                print(f"         Spend: ${alloc:.2f}  (liquidity: ${signal.size_usd:.2f})")
+                print(f"         Edge: {signal.edge:.1%}")
+            print()
+            print(f"     Total would spend: ${sim_spent:.2f} / ${budget:.2f}")
+
+        for signal in holds:
+            print(f"     --- HOLD on '{signal.outcome.outcome}'")
+            print(f"         Reason: {signal.reason}")
+
+        if not actionable and not holds:
             print("     No trading opportunities found")
             warnings.append("No signals generated")
     else:
