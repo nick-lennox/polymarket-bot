@@ -247,53 +247,38 @@ class PolymarketClient:
             return TradeResult(success=False, error=str(e))
 
     def discover_tsa_market(self, target_date=None):
-        """Auto-discover today's TSA passenger count market slug from Gamma API."""
+        """Build the TSA passenger count market slug for a given date.
+
+        Slug pattern is: number-of-tsa-passengers-{month}-{day}
+        Verifies the market exists on Gamma API before returning.
+        """
         from datetime import date as _date
         if target_date is None:
             target_date = _date.today()
 
         month_name = target_date.strftime('%B').lower()
         day = target_date.day
+        slug = f"number-of-tsa-passengers-{month_name}-{day}"
 
         try:
             resp = httpx.get(
                 f'{GAMMA_API_URL}/events',
-                params={'closed': 'false', 'limit': 50, 'tag': 'TSA'},
+                params={'slug': slug},
                 timeout=15.0,
             )
             resp.raise_for_status()
             events = resp.json()
 
-            if not events:
-                logger.info('No events found with TSA tag, trying text search...')
-                resp = httpx.get(
-                    f'{GAMMA_API_URL}/events',
-                    params={'closed': 'false', 'limit': 100},
-                    timeout=15.0,
-                )
-                resp.raise_for_status()
-                events = resp.json()
+            if events:
+                event_title = events[0].get("title", "")
+                logger.info(f"Verified TSA market exists: {slug} ({event_title})")
+                return slug
 
-            for event in events:
-                title = event.get('title', '').lower()
-                slug = event.get('slug', '')
-
-                if 'tsa' not in title and 'tsa' not in slug:
-                    continue
-
-                date_in_title = f'{month_name} {day}' in title
-                date_in_slug = f'{month_name}-{day}' in slug
-
-                if date_in_title or date_in_slug:
-                    event_title = event.get("title", "")
-                    logger.info(f"Auto-discovered TSA market: {slug} ({event_title})")
-                    return slug
-
-            logger.warning(f'Could not auto-discover TSA market for {target_date}')
+            logger.warning(f"TSA market not found for slug: {slug}")
             return None
 
         except Exception as e:
-            logger.error(f'Failed to auto-discover TSA market: {e}')
+            logger.error(f"Failed to verify TSA market {slug}: {e}")
             return None
 
     def get_balance_info(self) -> dict:
