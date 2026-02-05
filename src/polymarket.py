@@ -8,6 +8,7 @@ Uses Gamma API for market discovery and CLOB API for order execution.
 import json
 import logging
 from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Optional
 from enum import Enum
 
@@ -238,6 +239,56 @@ class PolymarketClient:
         except Exception as e:
             logger.error(f"Market buy failed: {e}")
             return TradeResult(success=False, error=str(e))
+
+    def discover_tsa_market(self, target_date=None):
+        """Auto-discover today's TSA passenger count market slug from Gamma API."""
+        from datetime import date as _date
+        if target_date is None:
+            target_date = _date.today()
+
+        month_name = target_date.strftime('%B').lower()
+        day = target_date.day
+
+        try:
+            resp = httpx.get(
+                f'{GAMMA_API_URL}/events',
+                params={'closed': 'false', 'limit': 50, 'tag': 'TSA'},
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            events = resp.json()
+
+            if not events:
+                logger.info('No events found with TSA tag, trying text search...')
+                resp = httpx.get(
+                    f'{GAMMA_API_URL}/events',
+                    params={'closed': 'false', 'limit': 100},
+                    timeout=15.0,
+                )
+                resp.raise_for_status()
+                events = resp.json()
+
+            for event in events:
+                title = event.get('title', '').lower()
+                slug = event.get('slug', '')
+
+                if 'tsa' not in title and 'tsa' not in slug:
+                    continue
+
+                date_in_title = f'{month_name} {day}' in title
+                date_in_slug = f'{month_name}-{day}' in slug
+
+                if date_in_title or date_in_slug:
+                    event_title = event.get("title", "")
+                    logger.info(f"Auto-discovered TSA market: {slug} ({event_title})")
+                    return slug
+
+            logger.warning(f'Could not auto-discover TSA market for {target_date}')
+            return None
+
+        except Exception as e:
+            logger.error(f'Failed to auto-discover TSA market: {e}')
+            return None
 
     def get_balance_info(self) -> dict:
         try:

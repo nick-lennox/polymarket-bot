@@ -121,8 +121,12 @@ class TradingBot:
 
         market_slug = self.settings.target_market_slug
         if not market_slug:
-            logger.warning("No target market configured - skipping trade")
-            return
+            logger.info("No TARGET_MARKET_SLUG set - attempting auto-discovery...")
+            market_slug = self.polymarket.discover_tsa_market(tsa_data.date)
+            if not market_slug:
+                logger.error("Auto-discovery failed - cannot determine market slug")
+                return
+            logger.info(f"Auto-discovered market slug: {market_slug}")
 
         logger.info(f"Fetching market: {market_slug}")
         market = self.polymarket.get_market_with_books(market_slug)

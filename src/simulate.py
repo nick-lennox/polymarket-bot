@@ -60,7 +60,7 @@ async def run_simulation():
     if not settings.polymarket_private_key:
         errors.append("POLYMARKET_PRIVATE_KEY is not set")
     if not settings.target_market_slug:
-        errors.append("TARGET_MARKET_SLUG is not set")
+        print("[INFO] TARGET_MARKET_SLUG not set - will use auto-discovery")
     if settings.dry_run:
         print("[OK] Dry run mode is ON (safe)")
     else:
@@ -104,9 +104,21 @@ async def run_simulation():
     # STEP 4: Market Discovery
     print_section("STEP 4: Market Discovery")
     market = None
-    if poly_client and settings.target_market_slug:
+    market_slug = settings.target_market_slug
+    if poly_client:
         try:
-            market = poly_client.get_market_with_books(settings.target_market_slug)
+            if not market_slug:
+                print("[INFO] Attempting auto-discovery of TSA market...")
+                if tsa_data:
+                    market_slug = poly_client.discover_tsa_market(tsa_data.date)
+                else:
+                    market_slug = poly_client.discover_tsa_market()
+                if market_slug:
+                    print(f"[OK] Auto-discovered market slug: {market_slug}")
+                else:
+                    errors.append("Auto-discovery failed - no TSA market found for today")
+            if market_slug:
+                market = poly_client.get_market_with_books(market_slug)
             if market:
                 print(f"[OK] Found market: {market.question}")
                 print(f"     Outcomes: {len(market.outcomes)}")
@@ -124,12 +136,9 @@ async def run_simulation():
                     else:
                         print(f"     {outcome.outcome:12s}  [no order book]")
             else:
-                errors.append(f"Market not found: {settings.target_market_slug}")
+                errors.append(f"Market not found: {market_slug}")
         except Exception as e:
             errors.append(f"Failed to discover market: {e}")
-    else:
-        if not settings.target_market_slug:
-            errors.append("TARGET_MARKET_SLUG not set")
 
     # STEP 5: Trading Simulation
     print_section("STEP 5: Trading Simulation")
