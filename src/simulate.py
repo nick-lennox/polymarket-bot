@@ -92,10 +92,8 @@ async def run_simulation():
             print("[OK] Connected to Polymarket CLOB")
 
             try:
-                balance = poly_client.get_balance()
-                print(f"[OK] USDC Balance: ${balance:.2f}")
-                if balance < 1.0:
-                    warnings.append(f"Low USDC balance: ${balance:.2f}")
+                balance_info = poly_client.get_balance_info()
+                print(f"[OK] Balance/Allowance: {balance_info}")
             except Exception as e:
                 warnings.append(f"Could not fetch balance: {e}")
         except Exception as e:

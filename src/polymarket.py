@@ -183,18 +183,18 @@ class PolymarketClient:
 
             bids = [
                 OrderBookLevel(
-                    price=float(level.get("price", 0)),
-                    size=float(level.get("size", 0)),
+                    price=float(level.price),
+                    size=float(level.size),
                 )
-                for level in book_data.get("bids", [])
+                for level in book_data.bids
             ]
 
             asks = [
                 OrderBookLevel(
-                    price=float(level.get("price", 0)),
-                    size=float(level.get("size", 0)),
+                    price=float(level.price),
+                    size=float(level.size),
                 )
-                for level in book_data.get("asks", [])
+                for level in book_data.asks
             ]
 
             bids.sort(key=lambda x: x.price, reverse=True)
@@ -239,9 +239,9 @@ class PolymarketClient:
             logger.error(f"Market buy failed: {e}")
             return TradeResult(success=False, error=str(e))
 
-    def get_balance(self):
+    def get_balance_info(self) -> dict:
         try:
-            return float(self.client.get_balance())
+            return self.client.get_balance_allowance()
         except Exception as e:
-            logger.error(f"Failed to get balance: {e}")
-            return 0.0
+            logger.error(f"Failed to get balance info: {e}")
+            return {}
