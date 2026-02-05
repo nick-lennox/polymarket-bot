@@ -64,15 +64,16 @@ class TradingBot:
     def _get_poll_interval(self) -> int:
         """Return poll interval based on time of day.
 
-        Hot window (8:00-14:30 ET weekdays): poll every 5 seconds
-        Outside hot window: use configured POLL_INTERVAL_SECONDS
+        Aggressive window (8:00-9:30 AM ET weekdays): poll every 3 seconds
+        TSA typically publishes data around 8:20 AM ET.
+        Outside window: use configured POLL_INTERVAL_SECONDS
         """
         now_et = datetime.now(ET_TIMEZONE)
         is_weekday = now_et.weekday() < 5
-        in_hot_window = time(8, 0) <= now_et.time() <= time(14, 30)
+        in_hot_window = time(8, 0) <= now_et.time() <= time(9, 30)
 
         if is_weekday and in_hot_window:
-            return 5
+            return 3
         return self.settings.poll_interval_seconds
 
     async def run(self):
@@ -81,7 +82,7 @@ class TradingBot:
 
         logger.info(f"Starting monitoring loop")
         logger.info(f"  Default poll interval: {self.settings.poll_interval_seconds}s")
-        logger.info(f"  Hot window (8:00-14:30 ET weekdays): 5s")
+        logger.info(f"  Hot window (8:00-9:30 AM ET weekdays): 3s")
         logger.info(f"Target market: {self.settings.target_market_slug or '(auto-discover)'}")
         logger.info(f"Dry run mode: {self.settings.dry_run}")
 
