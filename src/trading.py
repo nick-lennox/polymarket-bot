@@ -107,7 +107,10 @@ class TradingEngine:
         )
 
     def _brackets_match(self, outcome_name: str, bracket: str) -> bool:
-        """Check if an outcome name matches a bracket."""
+        """Check if an outcome name matches a bracket.
+
+        Strict matching to prevent buying the wrong bracket.
+        """
         # Normalize: remove spaces, lowercase
         o = outcome_name.lower().replace(" ", "").replace(",", "")
         b = bracket.lower().replace(" ", "").replace(",", "")
@@ -116,15 +119,35 @@ class TradingEngine:
         if b == o:
             return True
 
-        # Handle variations like "<1.5M" vs "<1.5m"
-        if b in o or o in b:
-            return True
-
-        # Extract numbers and compare
+        # Extract numbers and compare - must have same count and values
         o_nums = re.findall(r"[\d.]+", o)
         b_nums = re.findall(r"[\d.]+", b)
 
-        if o_nums and b_nums and o_nums == b_nums:
+        if not o_nums or not b_nums:
+            return False
+
+        if o_nums != b_nums:
+            return False
+
+        # Numbers match - verify same bracket type (both ranges, or both < or >)
+        o_has_range = "-" in o or "to" in o
+        b_has_range = "-" in b or "to" in b
+        o_has_lt = "<" in o or "under" in o or "less" in o or "below" in o
+        b_has_lt = "<" in b
+        o_has_gt = ">" in o or "over" in o or "more" in o or "above" in o
+        b_has_gt = ">" in b
+
+        # Both ranges with same numbers
+        if o_has_range and b_has_range:
+            return True
+        # Both less-than with same number
+        if o_has_lt and b_has_lt:
+            return True
+        # Both greater-than with same number
+        if o_has_gt and b_has_gt:
+            return True
+        # Bracket is range, outcome uses same numbers (flexible name match)
+        if len(o_nums) == len(b_nums) == 2 and not o_has_lt and not o_has_gt and not b_has_lt and not b_has_gt:
             return True
 
         return False
