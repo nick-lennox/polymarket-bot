@@ -2,7 +2,12 @@
 TSA Passenger Volume Scraper
 
 Monitors https://www.tsa.gov/travel/passenger-volumes for new daily passenger counts.
-Data is typically updated Monday-Friday by 9am ET.
+Data is typically updated Monday-Friday by ~8:20am ET.
+
+Optimizations:
+- Cache-busting query params to bypass Akamai CDN (10-min TTL)
+- If-Modified-Since conditional GET for lightweight polling (0 bytes on 304)
+- During hot window, uses conditional requests to poll aggressively
 """
 
 import asyncio
@@ -11,6 +16,7 @@ from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional
 import re
+import time
 
 import httpx
 from bs4 import BeautifulSoup
@@ -51,12 +57,21 @@ class TSADataPoint:
 
 
 class TSAScraper:
-    """Scrapes TSA passenger volume data."""
+    """Scrapes TSA passenger volume data.
+
+    Uses If-Modified-Since conditional GET for lightweight polling.
+    When the server returns 304 (Not Modified), no body is transferred (~0 bytes).
+    Only when content actually changes do we download the full ~150KB page.
+    """
 
     def __init__(self, timeout: float = 30.0):
         self.timeout = timeout
         self._last_known_date: Optional[date] = None
         self._client: Optional[httpx.AsyncClient] = None
+        self._last_modified: Optional[str] = None  # Last-Modified header from server
+        self._etag: Optional[str] = None  # ETag header from server
+        self._conditional_hits: int = 0  # 304 responses (no change)
+        self._conditional_misses: int = 0  # 200 responses (content changed)
 
     async def __aenter__(self):
         self._client = httpx.AsyncClient(
@@ -78,16 +93,81 @@ class TSAScraper:
     def last_known_date(self, value: date):
         self._last_known_date = value
 
+    @property
+    def conditional_stats(self) -> str:
+        total = self._conditional_hits + self._conditional_misses
+        if total == 0:
+            return "no conditional requests yet"
+        hit_rate = self._conditional_hits / total * 100
+        return f"{self._conditional_hits} hits / {self._conditional_misses} misses ({hit_rate:.0f}% cache hit rate)"
+
     async def fetch_page(self) -> str:
         if not self._client:
             raise RuntimeError("Scraper must be used as async context manager")
         # Cache-bust with timestamp to bypass CDN/Akamai 10-min TTL
-        import time
         cache_buster = int(time.time() * 1000)
         url = f"{TSA_URL}?_={cache_buster}"
         logger.debug(f"Fetching {url}")
         response = await self._client.get(url)
         response.raise_for_status()
+
+        # Store conditional headers for future lightweight requests
+        if "Last-Modified" in response.headers:
+            self._last_modified = response.headers["Last-Modified"]
+            logger.debug(f"Stored Last-Modified: {self._last_modified}")
+        if "ETag" in response.headers:
+            self._etag = response.headers["ETag"]
+            logger.debug(f"Stored ETag: {self._etag}")
+
+        return response.text
+
+
+    async def fetch_if_changed(self) -> Optional[str]:
+        """Lightweight conditional fetch - returns None if content unchanged.
+
+        Uses If-Modified-Since and If-None-Match headers. The server returns:
+        - 304 Not Modified (0 bytes) if content hasn't changed
+        - 200 OK with full page if content has changed
+
+        This saves ~150KB per request when polling every few seconds.
+        Falls back to full fetch if no conditional headers are stored yet.
+        """
+        if not self._client:
+            raise RuntimeError("Scraper must be used as async context manager")
+
+        # If we don't have conditional headers yet, do a full fetch
+        if not self._last_modified and not self._etag:
+            logger.debug("No conditional headers yet, doing full fetch")
+            return await self.fetch_page()
+
+        # Build conditional request headers
+        cache_buster = int(time.time() * 1000)
+        url = f"{TSA_URL}?_={cache_buster}"
+        conditional_headers = {}
+        if self._last_modified:
+            conditional_headers["If-Modified-Since"] = self._last_modified
+        if self._etag:
+            conditional_headers["If-None-Match"] = self._etag
+
+        logger.debug(f"Conditional fetch: If-Modified-Since={self._last_modified}")
+        response = await self._client.get(url, headers=conditional_headers)
+
+        if response.status_code == 304:
+            self._conditional_hits += 1
+            logger.debug(f"304 Not Modified (saved ~150KB) [{self.conditional_stats}]")
+            return None
+
+        # Content changed - we got a 200 with the full page
+        response.raise_for_status()
+        self._conditional_misses += 1
+        logger.info(f"Content changed! (200 OK, {len(response.text)} bytes) [{self.conditional_stats}]")
+
+        # Update conditional headers for next request
+        if "Last-Modified" in response.headers:
+            self._last_modified = response.headers["Last-Modified"]
+        if "ETag" in response.headers:
+            self._etag = response.headers["ETag"]
+
         return response.text
 
     def parse_html(self, html: str) -> list[TSADataPoint]:
@@ -157,18 +237,40 @@ class TSAScraper:
             return None
 
     async def check_for_new_data(self) -> Optional[TSADataPoint]:
-        latest = await self.get_latest_data()
-        if not latest:
+        """Check if TSA has published new data.
+
+        Uses conditional GET (If-Modified-Since) for lightweight polling.
+        Only downloads and parses the full page when the server indicates
+        content has changed.
+        """
+        try:
+            html = await self.fetch_if_changed()
+        except Exception as e:
+            logger.error(f"Failed to check TSA data: {e}")
             return None
+
+        if html is None:
+            # 304 - content hasn't changed, no new data
+            return None
+
+        # Content changed - parse and check for new date
+        data_points = self.parse_html(html)
+        if not data_points:
+            return None
+
+        latest = data_points[0]
+
         if self._last_known_date is None:
             logger.info(f"Initial data point: {latest.date} - {latest.formatted_count}")
             self._last_known_date = latest.date
             return None
+
         if latest.date > self._last_known_date:
             logger.info(f"NEW DATA DETECTED: {latest.date} - {latest.formatted_count}")
             self._last_known_date = latest.date
             return latest
-        logger.debug(f"No new data. Latest: {latest.date}")
+
+        logger.debug(f"Content changed but same date: {latest.date}")
         return None
 
     async def get_all_data(self) -> list[TSADataPoint]:
@@ -200,6 +302,19 @@ async def test_scraper():
             year_ago = f" (YoY: {dp.year_ago_count:,})" if dp.year_ago_count else ""
             bracket = dp.get_bracket()
             print(f"{dp.date}: {dp.formatted_count} passengers - Bracket: {bracket}{year_ago}")
+
+        # Test conditional GET
+        print("")
+        print("Testing conditional GET (should get 304 on second fetch)...")
+        html1 = await scraper.fetch_page()
+        print(f"  First fetch: {len(html1)} bytes")
+        html2 = await scraper.fetch_if_changed()
+        if html2 is None:
+            print(f"  Second fetch: 304 Not Modified (0 bytes transferred)")
+        else:
+            print(f"  Second fetch: {len(html2)} bytes (content changed)")
+        print(f"  Stats: {scraper.conditional_stats}")
+
         print("")
         print("=" * 50)
         print("Scraper test complete!")
