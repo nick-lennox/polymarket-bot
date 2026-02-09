@@ -1,0 +1,42 @@
+version: '3.8'
+
+services:
+  tsa-movement-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.movement
+    container_name: tsa-movement-bot
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Polymarket credentials
+      - POLYMARKET_PRIVATE_KEY=${POLYMARKET_PRIVATE_KEY}
+      - POLYMARKET_FUNDER=${POLYMARKET_FUNDER:-}
+      # Market config
+      - TARGET_MARKET_SLUG=${TARGET_MARKET_SLUG:-}
+      # Trading parameters
+      - MAX_TRADE_SIZE_USD=${MAX_TRADE_SIZE_USD:-50}
+      - MAX_BUY_PRICE=${MAX_BUY_PRICE:-0.95}
+      - DRY_RUN=${DRY_RUN:-true}
+      # Movement detection settings
+      - ZSCORE_THRESHOLD=${ZSCORE_THRESHOLD:-2.5}
+      - SCALE_IN_PCTS=${SCALE_IN_PCTS:-50,30,20}
+      - MIN_PRICE_CHANGE=${MIN_PRICE_CHANGE:-0.05}
+      - MONITOR_WINDOW_START_HOUR=${MONITOR_WINDOW_START_HOUR:-7}
+      - MONITOR_WINDOW_END_HOUR=${MONITOR_WINDOW_END_HOUR:-10}
+      # General
+      - POLL_INTERVAL_SECONDS=${POLL_INTERVAL_SECONDS:-30}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
