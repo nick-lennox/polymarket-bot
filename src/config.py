@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     dry_run: bool = Field(default=True, alias="DRY_RUN")
     poll_interval_seconds: int = Field(default=30, alias="POLL_INTERVAL_SECONDS")
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+    
+    # Movement detection settings
+    zscore_threshold: float = Field(default=2.5, alias="ZSCORE_THRESHOLD")
+    scale_in_pcts: str = Field(default="50,30,20", alias="SCALE_IN_PCTS")
+    min_price_change: float = Field(default=0.05, alias="MIN_PRICE_CHANGE")
+    monitor_window_start_hour: int = Field(default=7, alias="MONITOR_WINDOW_START_HOUR")
+    monitor_window_end_hour: int = Field(default=10, alias="MONITOR_WINDOW_END_HOUR")
 
     class Config:
         env_file = ".env"
@@ -100,6 +107,11 @@ def print_config(settings: Settings, hide_secrets: bool = True):
     print()
     print(f"Poll Interval: {settings.poll_interval_seconds}s")
     print(f"Log Level: {settings.log_level}")
+    print()
+    print(f"Z-Score Threshold: {settings.zscore_threshold}")
+    print(f"Scale-In Percentages: {settings.scale_in_pcts}")
+    print(f"Min Price Change: {settings.min_price_change}")
+    print(f"Monitor Window: {settings.monitor_window_start_hour}:00 - {settings.monitor_window_end_hour}:00 ET")
     print("=" * 50)
 
 
