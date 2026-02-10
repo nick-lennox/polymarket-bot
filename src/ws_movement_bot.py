@@ -214,18 +214,25 @@ class WebSocketMovementBot:
 
                             try:
                                 data = json.loads(message)
-                                event_type = data.get("event_type")
 
-                                if event_type == "book":
-                                    self._process_book_update(data)
-                                elif event_type == "price_change":
-                                    # Could also use these for faster detection
-                                    pass
+                                # Handle both single objects and arrays of updates
+                                updates = data if isinstance(data, list) else [data]
+
+                                for update in updates:
+                                    if not isinstance(update, dict):
+                                        continue
+                                    event_type = update.get("event_type")
+
+                                    if event_type == "book":
+                                        self._process_book_update(update)
+                                    elif event_type == "price_change":
+                                        # Could also use these for faster detection
+                                        pass
 
                             except json.JSONDecodeError:
                                 logger.warning(f"Invalid JSON: {message[:100]}")
                             except Exception as e:
-                                logger.error(f"Error processing message: {e}")
+                                logger.error(f"Error processing message: {e}", exc_info=True)
 
                     finally:
                         ping_task.cancel()
