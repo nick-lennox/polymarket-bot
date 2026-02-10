@@ -88,9 +88,17 @@ class MovementBot:
         if not self.polymarket or not self._current_market:
             return None
         try:
+            valid_books = 0
             for outcome in self._current_market.outcomes:
                 ob = self.polymarket.get_order_book(outcome.token_id)
                 outcome.order_book = ob
+                if ob and (ob.asks or ob.bids):
+                    valid_books += 1
+
+            if valid_books == 0:
+                logger.warning("No valid order books found - market may be resolved")
+                return None
+
             return self._current_market
         except Exception as e:
             logger.error(f"Failed to refresh order books: {e}")
