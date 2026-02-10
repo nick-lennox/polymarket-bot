@@ -207,7 +207,12 @@ class PolymarketClient:
 
             return OrderBook(token_id=token_id, bids=bids, asks=asks)
         except Exception as e:
-            logger.error(f"Failed to get order book for {token_id[:15]}...: {e}")
+            error_str = str(e)
+            # Don't spam logs for 404s (market resolved/no orderbook)
+            if "404" in error_str or "No orderbook exists" in error_str:
+                logger.debug(f"No order book for {token_id[:15]}... (likely resolved)")
+            else:
+                logger.error(f"Failed to get order book for {token_id[:15]}...: {e}")
             return None
 
     def get_market_with_books(self, event_slug: str) -> Optional[Market]:
