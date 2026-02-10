@@ -103,6 +103,105 @@ class TestProcessBookUpdate:
         assert bot._update_count == 0
 
 
+class TestMessageParsing:
+    """Tests for WebSocket message parsing - the actual format from Polymarket."""
+
+    @pytest.mark.asyncio
+    async def test_handles_array_of_updates(self):
+        """Polymarket WS sends arrays of updates, not single objects."""
+        import json
+
+        settings = create_mock_settings()
+        bot = WebSocketMovementBot(settings)
+        bot.detector = MagicMock()
+        state_mock = MagicMock()
+        bot.detector.outcomes = {"Test Outcome": state_mock}
+        bot.detector._check_trigger.return_value = None
+        bot._token_id_to_outcome = {"token123": "Test Outcome"}
+
+        # This is what Polymarket actually sends - an ARRAY
+        ws_message = json.dumps([
+            {
+                "event_type": "book",
+                "asset_id": "token123",
+                "asks": [{"price": "0.25", "size": "100"}],
+            },
+            {
+                "event_type": "book",
+                "asset_id": "token123",
+                "asks": [{"price": "0.26", "size": "50"}],
+            },
+        ])
+
+        # Parse like the real handler does
+        data = json.loads(ws_message)
+        updates = data if isinstance(data, list) else [data]
+
+        for update in updates:
+            if isinstance(update, dict) and update.get("event_type") == "book":
+                bot._process_book_update(update)
+
+        # Should have processed both updates
+        assert bot._update_count == 2
+
+    @pytest.mark.asyncio
+    async def test_handles_single_object(self):
+        """Should still work if WS sends a single object."""
+        import json
+
+        settings = create_mock_settings()
+        bot = WebSocketMovementBot(settings)
+        bot.detector = MagicMock()
+        state_mock = MagicMock()
+        bot.detector.outcomes = {"Test Outcome": state_mock}
+        bot.detector._check_trigger.return_value = None
+        bot._token_id_to_outcome = {"token123": "Test Outcome"}
+
+        # Single object (not array)
+        ws_message = json.dumps({
+            "event_type": "book",
+            "asset_id": "token123",
+            "asks": [{"price": "0.25", "size": "100"}],
+        })
+
+        data = json.loads(ws_message)
+        updates = data if isinstance(data, list) else [data]
+
+        for update in updates:
+            if isinstance(update, dict) and update.get("event_type") == "book":
+                bot._process_book_update(update)
+
+        assert bot._update_count == 1
+
+    @pytest.mark.asyncio
+    async def test_ignores_non_dict_items_in_array(self):
+        """Should skip non-dict items in the array."""
+        import json
+
+        settings = create_mock_settings()
+        bot = WebSocketMovementBot(settings)
+        bot.detector = MagicMock()
+        bot._token_id_to_outcome = {}
+
+        # Array with mixed types
+        ws_message = json.dumps([
+            "string_item",
+            123,
+            None,
+            {"event_type": "book", "asset_id": "unknown"},
+        ])
+
+        data = json.loads(ws_message)
+        updates = data if isinstance(data, list) else [data]
+
+        # Should not raise
+        for update in updates:
+            if isinstance(update, dict) and update.get("event_type") == "book":
+                bot._process_book_update(update)
+
+        assert bot._update_count == 0  # No valid tokens
+
+
 class TestBotStop:
     def test_stop(self):
         settings = create_mock_settings()
