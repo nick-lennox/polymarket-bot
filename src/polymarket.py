@@ -253,12 +253,17 @@ class PolymarketClient:
         Verifies the market exists on Gamma API before returning.
         """
         from datetime import date as _date
+        import pytz
+
         if target_date is None:
-            target_date = _date.today()
+            # Use ET date, not UTC - TSA markets are based on ET
+            et_tz = pytz.timezone("America/New_York")
+            target_date = datetime.now(et_tz).date()
 
         month_name = target_date.strftime('%B').lower()
         day = target_date.day
         slug = f"number-of-tsa-passengers-{month_name}-{day}"
+        expected_title_part = f"{target_date.strftime('%B')} {day}"
 
         try:
             resp = httpx.get(
@@ -271,6 +276,11 @@ class PolymarketClient:
 
             if events:
                 event_title = events[0].get("title", "")
+                # Verify the returned market matches expected date
+                if expected_title_part not in event_title:
+                    logger.error(f"Market date mismatch! Expected '{expected_title_part}' but got '{event_title}'")
+                    logger.error(f"This may indicate the market for today doesn't exist yet")
+                    return None
                 logger.info(f"Verified TSA market exists: {slug} ({event_title})")
                 return slug
 
