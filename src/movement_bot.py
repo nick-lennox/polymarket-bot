@@ -158,10 +158,13 @@ class MovementBot:
                     logger.info("=== MONITOR WINDOW ENDED ===")
                     status = self.detector.get_status()
                     logger.info(f"Session summary: {status['total_signals']} signals, {status['budget_spent_pct']}% budget used")
-                
+                    # Clear state so next window starts fresh
+                    self._current_market = None
+                    self.detector.reset()
+
                 was_in_window = in_window
-                
-                # Active monitoring
+
+                # Active monitoring - only if we have a market for TODAY
                 if in_window and self._current_market and self.detector.baseline_set:
                     market = await self._refresh_order_books()
                     if market:
