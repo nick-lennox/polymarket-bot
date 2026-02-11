@@ -187,7 +187,7 @@ class WebSocketMovementBot:
         """Main WebSocket connection and message loop."""
         reconnect_delay = RECONNECT_DELAY
 
-        while self._running:
+        while self._running and getattr(self, '_ws_should_run', True):
             try:
                 logger.info(f"Connecting to WebSocket: {WS_MARKET_URL}")
                 async with ws_connect(
@@ -250,7 +250,7 @@ class WebSocketMovementBot:
 
             self._ws = None
 
-            if self._running:
+            if self._running and getattr(self, '_ws_should_run', True):
                 logger.info(f"Reconnecting in {reconnect_delay}s...")
                 await asyncio.sleep(reconnect_delay)
                 reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY)
@@ -276,6 +276,7 @@ class WebSocketMovementBot:
                     self._budget_remaining = self.settings.max_trade_size_usd
                     self.detector.reset()
                     self._update_count = 0
+                    self._ws_should_run = True  # Flag to control WebSocket loop
 
                     self._current_market = await self._discover_market()
                     if self._current_market:
@@ -289,7 +290,9 @@ class WebSocketMovementBot:
                         while self._running and self._in_monitor_window():
                             await asyncio.sleep(1)
 
-                        # Stop WebSocket
+                        # Stop WebSocket - set flag first to prevent reconnects
+                        logger.info("Window ending, stopping WebSocket...")
+                        self._ws_should_run = False
                         if self._ws:
                             await self._ws.close()
                         ws_task.cancel()
@@ -297,6 +300,7 @@ class WebSocketMovementBot:
                             await ws_task
                         except asyncio.CancelledError:
                             pass
+                        logger.info("WebSocket stopped")
 
                 # Window just ended
                 if not in_window and was_in_window:
