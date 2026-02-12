@@ -256,14 +256,20 @@ class PolymarketClient:
 
         Slug pattern is: number-of-tsa-passengers-{month}-{day}
         Verifies the market exists on Gamma API before returning.
+
+        NOTE: TSA releases YESTERDAY's data each morning. So at 7 AM on Feb 12,
+        we want to trade the Feb 11 market, not Feb 12.
         """
-        from datetime import date as _date
+        from datetime import date as _date, timedelta
         import pytz
 
         if target_date is None:
             # Use ET date, not UTC - TSA markets are based on ET
             et_tz = pytz.timezone("America/New_York")
-            target_date = datetime.now(et_tz).date()
+            today_et = datetime.now(et_tz).date()
+            # TSA releases YESTERDAY's data, so trade yesterday's market
+            target_date = today_et - timedelta(days=1)
+            logger.info(f"TSA data release: trading yesterday's market ({target_date})")
 
         month_name = target_date.strftime('%B').lower()
         day = target_date.day
