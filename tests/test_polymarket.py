@@ -1,0 +1,182 @@
+"""
+Tests for the Polymarket module - market discovery and API interactions.
+"""
+
+import pytest
+from datetime import date, datetime, timedelta
+from unittest.mock import MagicMock, patch
+import pytz
+
+from src.polymarket import PolymarketClient
+
+
+ET_TIMEZONE = pytz.timezone("America/New_York")
+
+
+class TestDiscoverTsaMarket:
+    """Tests for TSA market discovery logic.
+
+    CRITICAL: TSA releases YESTERDAY's passenger data each morning.
+    At 7 AM on Feb 12, we trade the Feb 11 market, not Feb 12.
+    """
+
+    def test_discovers_yesterdays_market_not_todays(self):
+        """
+        This is the key test that would have caught the wrong-day bug.
+
+        On Feb 12 at 7 AM ET, we should be looking for:
+        - number-of-tsa-passengers-february-11 (CORRECT)
+        - NOT number-of-tsa-passengers-february-12 (WRONG)
+        """
+        config = MagicMock()
+        config.api_url = "https://clob.polymarket.com"
+        config.private_key = None
+
+        client = PolymarketClient(config)
+
+        # Mock the current time as Feb 12, 7:00 AM ET
+        feb_12_7am_et = datetime(2026, 2, 12, 7, 0, 0, tzinfo=ET_TIMEZONE)
+
+        with patch('src.polymarket.datetime') as mock_datetime:
+            mock_datetime.now.return_value = feb_12_7am_et
+            mock_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+            with patch('src.polymarket.httpx.get') as mock_get:
+                mock_response = MagicMock()
+                mock_response.json.return_value = [{
+                    "title": "Number of TSA Passengers February 11?",
+                    "slug": "number-of-tsa-passengers-february-11"
+                }]
+                mock_response.raise_for_status = MagicMock()
+                mock_get.return_value = mock_response
+
+                slug = client.discover_tsa_market()
+
+                # Should request YESTERDAY's market (Feb 11), not today's (Feb 12)
+                call_args = mock_get.call_args
+                params = call_args.kwargs.get('params') or call_args[1].get('params')
+
+                assert params['slug'] == 'number-of-tsa-passengers-february-11', \
+                    f"Expected february-11 but got {params['slug']}"
+                assert slug == 'number-of-tsa-passengers-february-11'
+
+    def test_uses_et_timezone_not_utc(self):
+        """
+        At 11 PM UTC on Feb 11 = 6 PM ET on Feb 11.
+        Should still be looking at Feb 10's market (yesterday in ET).
+        """
+        config = MagicMock()
+        config.api_url = "https://clob.polymarket.com"
+        config.private_key = None
+
+        client = PolymarketClient(config)
+
+        # 11 PM UTC on Feb 11 = 6 PM ET on Feb 11
+        # Yesterday in ET is Feb 10
+        feb_11_11pm_utc = datetime(2026, 2, 11, 23, 0, 0, tzinfo=pytz.UTC)
+        feb_11_6pm_et = feb_11_11pm_utc.astimezone(ET_TIMEZONE)
+
+        with patch('src.polymarket.datetime') as mock_datetime:
+            mock_datetime.now.return_value = feb_11_6pm_et
+            mock_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+            with patch('src.polymarket.httpx.get') as mock_get:
+                mock_response = MagicMock()
+                mock_response.json.return_value = [{
+                    "title": "Number of TSA Passengers February 10?",
+                    "slug": "number-of-tsa-passengers-february-10"
+                }]
+                mock_response.raise_for_status = MagicMock()
+                mock_get.return_value = mock_response
+
+                slug = client.discover_tsa_market()
+
+                call_args = mock_get.call_args
+                params = call_args.kwargs.get('params') or call_args[1].get('params')
+
+                # Should be Feb 10 (yesterday in ET), not Feb 11
+                assert 'february-10' in params['slug'], \
+                    f"Expected february-10 but got {params['slug']}"
+
+    def test_explicit_date_overrides_auto_discovery(self):
+        """When a specific date is passed, use that date directly."""
+        config = MagicMock()
+        config.api_url = "https://clob.polymarket.com"
+        config.private_key = None
+
+        client = PolymarketClient(config)
+
+        with patch('src.polymarket.httpx.get') as mock_get:
+            mock_response = MagicMock()
+            mock_response.json.return_value = [{
+                "title": "Number of TSA Passengers February 15?",
+                "slug": "number-of-tsa-passengers-february-15"
+            }]
+            mock_response.raise_for_status = MagicMock()
+            mock_get.return_value = mock_response
+
+            # Explicitly pass Feb 15
+            slug = client.discover_tsa_market(target_date=date(2026, 2, 15))
+
+            call_args = mock_get.call_args
+            params = call_args.kwargs.get('params') or call_args[1].get('params')
+
+            assert params['slug'] == 'number-of-tsa-passengers-february-15'
+
+    def test_rejects_market_with_wrong_date_in_title(self):
+        """
+        If the API returns a market with the wrong date in the title,
+        we should reject it (prevents trading resolved markets).
+        """
+        config = MagicMock()
+        config.api_url = "https://clob.polymarket.com"
+        config.private_key = None
+
+        client = PolymarketClient(config)
+
+        with patch('src.polymarket.httpx.get') as mock_get:
+            mock_response = MagicMock()
+            # API returns Feb 4 market when we asked for Feb 11
+            mock_response.json.return_value = [{
+                "title": "Number of TSA Passengers February 4?",
+                "slug": "number-of-tsa-passengers-february-4"
+            }]
+            mock_response.raise_for_status = MagicMock()
+            mock_get.return_value = mock_response
+
+            # Ask for Feb 11
+            slug = client.discover_tsa_market(target_date=date(2026, 2, 11))
+
+            # Should return None because title doesn't match
+            assert slug is None, "Should reject market with wrong date in title"
+
+    def test_handles_month_boundary(self):
+        """On March 1, yesterday is Feb 28 (or 29 in leap year)."""
+        config = MagicMock()
+        config.api_url = "https://clob.polymarket.com"
+        config.private_key = None
+
+        client = PolymarketClient(config)
+
+        # March 1, 2026 at 8 AM ET - yesterday is Feb 28, 2026
+        march_1_8am_et = datetime(2026, 3, 1, 8, 0, 0, tzinfo=ET_TIMEZONE)
+
+        with patch('src.polymarket.datetime') as mock_datetime:
+            mock_datetime.now.return_value = march_1_8am_et
+            mock_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+            with patch('src.polymarket.httpx.get') as mock_get:
+                mock_response = MagicMock()
+                mock_response.json.return_value = [{
+                    "title": "Number of TSA Passengers February 28?",
+                    "slug": "number-of-tsa-passengers-february-28"
+                }]
+                mock_response.raise_for_status = MagicMock()
+                mock_get.return_value = mock_response
+
+                slug = client.discover_tsa_market()
+
+                call_args = mock_get.call_args
+                params = call_args.kwargs.get('params') or call_args[1].get('params')
+
+                assert params['slug'] == 'number-of-tsa-passengers-february-28'
