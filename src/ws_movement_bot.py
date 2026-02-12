@@ -325,13 +325,26 @@ class WebSocketMovementBot:
         self._running = False
 
 
+class ETFormatter(logging.Formatter):
+    """Formatter that converts timestamps to Eastern Time."""
+    def formatTime(self, record, datefmt=None):
+        dt = datetime.fromtimestamp(record.created, tz=ET_TIMEZONE)
+        if datefmt:
+            return dt.strftime(datefmt)
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def setup_logging(level: str = "INFO"):
-    """Configure logging for the bot."""
-    logging.basicConfig(
-        level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    """Configure logging for the bot with ET timestamps."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(ETFormatter(
+        fmt="%(asctime)s ET | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    ))
+    logging.root.handlers = []
+    logging.root.addHandler(handler)
+    logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    # Quiet noisy libraries
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("websockets").setLevel(logging.WARNING)
