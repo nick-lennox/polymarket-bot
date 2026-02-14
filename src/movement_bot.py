@@ -72,34 +72,44 @@ class MovementBot:
             return 1.5
         return self.settings.poll_interval_seconds
     
-    async def _discover_market(self) -> Optional[Market]:
+    async def _discover_markets(self) -> list[Market]:
+        """Discover all markets to trade today. Returns list of Markets."""
         if not self.polymarket:
-            return None
-        slug = self.settings.target_market_slug
-        if not slug:
-            slug = self.polymarket.discover_tsa_market(date.today())
-            if not slug:
-                logger.error("Could not auto-discover market")
-                return None
-            logger.info(f"Auto-discovered: {slug}")
-        return self.polymarket.get_market_with_books(slug)
+            return []
+
+        # If explicit slug set, use that
+        if self.settings.target_market_slug:
+            market = self.polymarket.get_market_with_books(self.settings.target_market_slug)
+            return [market] if market else []
+
+        # Auto-discover (handles Monday = 3 markets, etc.)
+        slugs = self.polymarket.discover_tsa_markets()
+        markets = []
+        for slug in slugs:
+            market = self.polymarket.get_market_with_books(slug)
+            if market:
+                markets.append(market)
+                logger.info(f"Loaded market: {market.question}")
+
+        return markets
     
-    async def _refresh_order_books(self) -> Optional[Market]:
-        if not self.polymarket or not self._current_market:
+    async def _refresh_order_books_for_market(self, market: Market) -> Optional[Market]:
+        """Refresh order books for a specific market."""
+        if not self.polymarket:
             return None
         try:
             valid_books = 0
-            for outcome in self._current_market.outcomes:
+            for outcome in market.outcomes:
                 ob = self.polymarket.get_order_book(outcome.token_id)
                 outcome.order_book = ob
                 if ob and (ob.asks or ob.bids):
                     valid_books += 1
 
             if valid_books == 0:
-                logger.warning("No valid order books found - market may be resolved")
+                logger.debug(f"No valid order books for {market.event_slug} - may be resolved")
                 return None
 
-            return self._current_market
+            return market
         except Exception as e:
             logger.error(f"Failed to refresh order books: {e}")
             return None
@@ -134,44 +144,71 @@ class MovementBot:
         logger.info(f"  Z-score threshold: {self.settings.zscore_threshold}")
         logger.info(f"  Budget: ${self.settings.max_trade_size_usd}")
         logger.info(f"  Dry run: {self.settings.dry_run}")
-        
+
         was_in_window = False
         last_interval = None
-        
+        self._current_markets: list[Market] = []
+        self._market_detectors: dict[str, MovementDetector] = {}  # slug -> detector
+
         while self._running:
             try:
                 in_window = self._in_monitor_window()
-                
+
                 # Window just started
                 if in_window and not was_in_window:
                     logger.info("=== MONITOR WINDOW STARTED ===")
                     self._budget_remaining = self.settings.max_trade_size_usd
-                    self.detector.reset()
-                    
-                    self._current_market = await self._discover_market()
-                    if self._current_market:
-                        logger.info(f"Market: {self._current_market.question}")
-                        self.detector.set_baseline(self._current_market.outcomes)
-                
+
+                    # Discover all markets for today (1 on Tue-Fri, 3 on Monday)
+                    self._current_markets = await self._discover_markets()
+                    num_markets = len(self._current_markets)
+
+                    if num_markets > 0:
+                        # Split budget evenly across markets
+                        budget_per_market = self.settings.max_trade_size_usd / num_markets
+                        logger.info(f"Trading {num_markets} market(s), ${budget_per_market:.2f} budget each")
+
+                        # Create a detector for each market
+                        self._market_detectors = {}
+                        for market in self._current_markets:
+                            scale_pcts = parse_scale_in_pcts(self.settings.scale_in_pcts)
+                            detector = MovementDetector(
+                                zscore_threshold=self.settings.zscore_threshold,
+                                scale_in_pcts=scale_pcts,
+                                max_buy_price=self.settings.max_buy_price,
+                                min_price_change=self.settings.min_price_change,
+                            )
+                            detector.set_baseline(market.outcomes)
+                            self._market_detectors[market.event_slug] = detector
+                            logger.info(f"  Market: {market.question}")
+                    else:
+                        logger.warning("No markets found to trade")
+
                 # Window just ended
                 if not in_window and was_in_window:
                     logger.info("=== MONITOR WINDOW ENDED ===")
-                    status = self.detector.get_status()
-                    logger.info(f"Session summary: {status['total_signals']} signals, {status['budget_spent_pct']}% budget used")
+                    total_signals = sum(d.total_signals for d in self._market_detectors.values())
+                    logger.info(f"Session summary: {total_signals} signals across {len(self._current_markets)} market(s)")
                     # Clear state so next window starts fresh
-                    self._current_market = None
-                    self.detector.reset()
+                    self._current_markets = []
+                    self._market_detectors = {}
 
                 was_in_window = in_window
 
-                # Active monitoring - only if we have a market for TODAY
-                if in_window and self._current_market and self.detector.baseline_set:
-                    market = await self._refresh_order_books()
-                    if market:
-                        signals = self.detector.update_prices(market.outcomes)
-                        for signal in signals:
-                            self._execute_signal(signal)
-                
+                # Active monitoring - poll all markets
+                if in_window and self._current_markets:
+                    for market in self._current_markets:
+                        detector = self._market_detectors.get(market.event_slug)
+                        if not detector or not detector.baseline_set:
+                            continue
+
+                        # Refresh order books for this market
+                        refreshed = await self._refresh_order_books_for_market(market)
+                        if refreshed:
+                            signals = detector.update_prices(market.outcomes)
+                            for signal in signals:
+                                self._execute_signal(signal)
+
                 interval = self._get_poll_interval()
                 if interval != last_interval:
                     logger.info(f"Poll interval: {interval}s")

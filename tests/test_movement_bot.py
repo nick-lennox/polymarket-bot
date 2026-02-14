@@ -78,14 +78,14 @@ class TestExecuteSignal:
         bot.polymarket.buy_market_order.assert_not_called()
 
 
-class TestDiscoverMarket:
+class TestDiscoverMarkets:
     @pytest.mark.asyncio
     async def test_without_polymarket(self):
         settings = create_mock_settings()
         bot = MovementBot(settings)
         bot.polymarket = None
-        result = await bot._discover_market()
-        assert result is None
+        result = await bot._discover_markets()
+        assert result == []
 
 
 class TestBotStop:

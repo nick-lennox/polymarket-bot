@@ -268,27 +268,11 @@ class PolymarketClient:
             et_tz = pytz.timezone("America/New_York")
             today_et = datetime.now(et_tz).date()
 
-            # TSA releases YESTERDAY's data, so trade yesterday's market
-            # But TSA doesn't publish on weekends, so:
-            # - Monday → trade Friday's market (3 days ago)
-            # - Sunday → trade Friday's market (2 days ago)
-            # - Saturday → trade Friday's market (1 day ago)
-            # - Otherwise → trade yesterday's market
-            weekday = today_et.weekday()  # Monday=0, Sunday=6
-            if weekday == 0:  # Monday
-                days_back = 3  # Friday
-                logger.info("Monday: TSA releases Friday's data")
-            elif weekday == 6:  # Sunday
-                days_back = 2  # Friday
-                logger.info("Sunday: no TSA data release, using Friday's market")
-            elif weekday == 5:  # Saturday
-                days_back = 1  # Friday
-                logger.info("Saturday: no TSA data release, using Friday's market")
-            else:
-                days_back = 1  # Yesterday
-
-            target_date = today_et - timedelta(days=days_back)
-            logger.info(f"TSA data release: trading {target_date.strftime('%A %B %d')} market")
+            # TSA releases data Mon-Fri by 9 AM ET
+            # On Monday, they release Fri + Sat + Sun data
+            # Use discover_tsa_markets() (plural) for Monday to get all 3
+            target_date = today_et - timedelta(days=1)
+            logger.info(f"Trading yesterday's market: {target_date.strftime('%A %B %d')}")
 
         month_name = target_date.strftime('%B').lower()
         day = target_date.day
@@ -320,6 +304,45 @@ class PolymarketClient:
         except Exception as e:
             logger.error(f"Failed to verify TSA market {slug}: {e}")
             return None
+
+    def discover_tsa_markets(self) -> list[str]:
+        """Discover all TSA markets to trade today.
+
+        TSA releases data Mon-Fri by 9 AM ET:
+        - Tue-Fri: releases yesterday's data → 1 market
+        - Monday: releases Fri + Sat + Sun data → 3 markets
+        - Sat/Sun: no new data released → 0 markets (but could still trade if markets exist)
+
+        Returns list of market slugs.
+        """
+        from datetime import timedelta
+        import pytz
+
+        et_tz = pytz.timezone("America/New_York")
+        today_et = datetime.now(et_tz).date()
+        weekday = today_et.weekday()  # Monday=0, Sunday=6
+
+        markets = []
+
+        if weekday == 0:  # Monday - TSA releases Fri, Sat, Sun
+            logger.info("Monday: TSA releases Friday, Saturday, and Sunday data")
+            for days_back in [3, 2, 1]:  # Fri, Sat, Sun
+                target_date = today_et - timedelta(days=days_back)
+                slug = self.discover_tsa_market(target_date=target_date)
+                if slug:
+                    markets.append(slug)
+        elif weekday in [5, 6]:  # Sat/Sun - no TSA release, but try yesterday's market
+            logger.info(f"Weekend: no TSA release, trying yesterday's market")
+            slug = self.discover_tsa_market()  # Uses yesterday by default
+            if slug:
+                markets.append(slug)
+        else:  # Tue-Fri - normal case, yesterday's data
+            slug = self.discover_tsa_market()  # Uses yesterday by default
+            if slug:
+                markets.append(slug)
+
+        logger.info(f"Found {len(markets)} market(s) to trade: {markets}")
+        return markets
 
     def get_balance_info(self) -> dict:
         try:

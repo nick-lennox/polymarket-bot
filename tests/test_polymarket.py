@@ -151,25 +151,25 @@ class TestDiscoverTsaMarket:
             assert slug is None, "Should reject market with wrong date in title"
 
     def test_handles_month_boundary(self):
-        """On March 2 (Monday), we go back to Friday Feb 27."""
+        """On March 1, yesterday is Feb 28."""
         config = MagicMock()
         config.api_url = "https://clob.polymarket.com"
         config.private_key = None
 
         client = PolymarketClient(config)
 
-        # March 2, 2026 is a Monday, so we go back 3 days to Friday Feb 27
-        march_2_8am_et = datetime(2026, 3, 2, 8, 0, 0, tzinfo=ET_TIMEZONE)
+        # March 1, 2026 at 8 AM ET - yesterday is Feb 28
+        march_1_8am_et = datetime(2026, 3, 1, 8, 0, 0, tzinfo=ET_TIMEZONE)
 
         with patch('src.polymarket.datetime') as mock_datetime:
-            mock_datetime.now.return_value = march_2_8am_et
+            mock_datetime.now.return_value = march_1_8am_et
             mock_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
 
             with patch('src.polymarket.httpx.get') as mock_get:
                 mock_response = MagicMock()
                 mock_response.json.return_value = [{
-                    "title": "Number of TSA Passengers February 27?",
-                    "slug": "number-of-tsa-passengers-february-27"
+                    "title": "Number of TSA Passengers February 28?",
+                    "slug": "number-of-tsa-passengers-february-28"
                 }]
                 mock_response.raise_for_status = MagicMock()
                 mock_get.return_value = mock_response
@@ -179,14 +179,11 @@ class TestDiscoverTsaMarket:
                 call_args = mock_get.call_args
                 params = call_args.kwargs.get('params') or call_args[1].get('params')
 
-                # Monday March 2 - 3 days = Friday Feb 27
-                assert params['slug'] == 'number-of-tsa-passengers-february-27'
+                # March 1 - 1 day = Feb 28
+                assert params['slug'] == 'number-of-tsa-passengers-february-28'
 
-    def test_monday_trades_fridays_market(self):
-        """
-        TSA doesn't publish on weekends.
-        On Monday morning, we should trade Friday's market.
-        """
+    def test_monday_trades_sundays_market(self):
+        """On Monday, trade yesterday's (Sunday's) market."""
         config = MagicMock()
         config.api_url = "https://clob.polymarket.com"
         config.private_key = None
@@ -203,8 +200,8 @@ class TestDiscoverTsaMarket:
             with patch('src.polymarket.httpx.get') as mock_get:
                 mock_response = MagicMock()
                 mock_response.json.return_value = [{
-                    "title": "Number of TSA Passengers February 13?",
-                    "slug": "number-of-tsa-passengers-february-13"
+                    "title": "Number of TSA Passengers February 15?",
+                    "slug": "number-of-tsa-passengers-february-15"
                 }]
                 mock_response.raise_for_status = MagicMock()
                 mock_get.return_value = mock_response
@@ -214,12 +211,12 @@ class TestDiscoverTsaMarket:
                 call_args = mock_get.call_args
                 params = call_args.kwargs.get('params') or call_args[1].get('params')
 
-                # Monday Feb 16 - 3 days = Friday Feb 13
-                assert params['slug'] == 'number-of-tsa-passengers-february-13', \
-                    f"On Monday, expected Friday's market (february-13) but got {params['slug']}"
+                # Monday Feb 16 - 1 day = Sunday Feb 15
+                assert params['slug'] == 'number-of-tsa-passengers-february-15', \
+                    f"On Monday, expected Sunday's market (february-15) but got {params['slug']}"
 
-    def test_saturday_uses_fridays_market(self):
-        """On Saturday, no TSA data - should still use Friday's market."""
+    def test_saturday_trades_fridays_market(self):
+        """On Saturday, trade yesterday's (Friday's) market."""
         config = MagicMock()
         config.api_url = "https://clob.polymarket.com"
         config.private_key = None
@@ -250,8 +247,8 @@ class TestDiscoverTsaMarket:
                 # Saturday Feb 14 - 1 day = Friday Feb 13
                 assert params['slug'] == 'number-of-tsa-passengers-february-13'
 
-    def test_sunday_uses_fridays_market(self):
-        """On Sunday, no TSA data - should use Friday's market."""
+    def test_sunday_trades_saturdays_market(self):
+        """On Sunday, trade yesterday's (Saturday's) market."""
         config = MagicMock()
         config.api_url = "https://clob.polymarket.com"
         config.private_key = None
@@ -268,8 +265,8 @@ class TestDiscoverTsaMarket:
             with patch('src.polymarket.httpx.get') as mock_get:
                 mock_response = MagicMock()
                 mock_response.json.return_value = [{
-                    "title": "Number of TSA Passengers February 13?",
-                    "slug": "number-of-tsa-passengers-february-13"
+                    "title": "Number of TSA Passengers February 14?",
+                    "slug": "number-of-tsa-passengers-february-14"
                 }]
                 mock_response.raise_for_status = MagicMock()
                 mock_get.return_value = mock_response
@@ -279,5 +276,75 @@ class TestDiscoverTsaMarket:
                 call_args = mock_get.call_args
                 params = call_args.kwargs.get('params') or call_args[1].get('params')
 
-                # Sunday Feb 15 - 2 days = Friday Feb 13
-                assert params['slug'] == 'number-of-tsa-passengers-february-13'
+                # Sunday Feb 15 - 1 day = Saturday Feb 14
+                assert params['slug'] == 'number-of-tsa-passengers-february-14'
+
+
+class TestDiscoverTsaMarkets:
+    """Tests for discover_tsa_markets() - plural, returns multiple markets on Monday."""
+
+    def test_monday_returns_three_markets(self):
+        """On Monday, TSA releases Fri + Sat + Sun data → 3 markets."""
+        config = MagicMock()
+        config.api_url = "https://clob.polymarket.com"
+        config.private_key = None
+
+        client = PolymarketClient(config)
+
+        # Monday Feb 16, 2026 at 8 AM ET
+        monday_8am_et = datetime(2026, 2, 16, 8, 0, 0, tzinfo=ET_TIMEZONE)
+
+        with patch('src.polymarket.datetime') as mock_datetime:
+            mock_datetime.now.return_value = monday_8am_et
+            mock_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+            with patch('src.polymarket.httpx.get') as mock_get:
+                def mock_response_for_slug(url, params, timeout):
+                    slug = params['slug']
+                    day = slug.split('-')[-1]
+                    response = MagicMock()
+                    response.json.return_value = [{
+                        "title": f"Number of TSA Passengers February {day}?",
+                        "slug": slug
+                    }]
+                    response.raise_for_status = MagicMock()
+                    return response
+
+                mock_get.side_effect = mock_response_for_slug
+
+                markets = client.discover_tsa_markets()
+
+                # Monday should return Fri (13), Sat (14), Sun (15)
+                assert len(markets) == 3
+                assert 'february-13' in markets[0]  # Friday
+                assert 'february-14' in markets[1]  # Saturday
+                assert 'february-15' in markets[2]  # Sunday
+
+    def test_tuesday_returns_one_market(self):
+        """On Tuesday, TSA releases Monday's data → 1 market."""
+        config = MagicMock()
+        config.api_url = "https://clob.polymarket.com"
+        config.private_key = None
+
+        client = PolymarketClient(config)
+
+        # Tuesday Feb 17, 2026 at 8 AM ET
+        tuesday_8am_et = datetime(2026, 2, 17, 8, 0, 0, tzinfo=ET_TIMEZONE)
+
+        with patch('src.polymarket.datetime') as mock_datetime:
+            mock_datetime.now.return_value = tuesday_8am_et
+            mock_datetime.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+            with patch('src.polymarket.httpx.get') as mock_get:
+                mock_response = MagicMock()
+                mock_response.json.return_value = [{
+                    "title": "Number of TSA Passengers February 16?",
+                    "slug": "number-of-tsa-passengers-february-16"
+                }]
+                mock_response.raise_for_status = MagicMock()
+                mock_get.return_value = mock_response
+
+                markets = client.discover_tsa_markets()
+
+                assert len(markets) == 1
+                assert markets[0] == 'number-of-tsa-passengers-february-16'
