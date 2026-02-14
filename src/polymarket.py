@@ -267,9 +267,28 @@ class PolymarketClient:
             # Use ET date, not UTC - TSA markets are based on ET
             et_tz = pytz.timezone("America/New_York")
             today_et = datetime.now(et_tz).date()
+
             # TSA releases YESTERDAY's data, so trade yesterday's market
-            target_date = today_et - timedelta(days=1)
-            logger.info(f"TSA data release: trading yesterday's market ({target_date})")
+            # But TSA doesn't publish on weekends, so:
+            # - Monday → trade Friday's market (3 days ago)
+            # - Sunday → trade Friday's market (2 days ago)
+            # - Saturday → trade Friday's market (1 day ago)
+            # - Otherwise → trade yesterday's market
+            weekday = today_et.weekday()  # Monday=0, Sunday=6
+            if weekday == 0:  # Monday
+                days_back = 3  # Friday
+                logger.info("Monday: TSA releases Friday's data")
+            elif weekday == 6:  # Sunday
+                days_back = 2  # Friday
+                logger.info("Sunday: no TSA data release, using Friday's market")
+            elif weekday == 5:  # Saturday
+                days_back = 1  # Friday
+                logger.info("Saturday: no TSA data release, using Friday's market")
+            else:
+                days_back = 1  # Yesterday
+
+            target_date = today_et - timedelta(days=days_back)
+            logger.info(f"TSA data release: trading {target_date.strftime('%A %B %d')} market")
 
         month_name = target_date.strftime('%B').lower()
         day = target_date.day
