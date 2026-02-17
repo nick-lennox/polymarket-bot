@@ -79,6 +79,7 @@ class Market:
     question: str
     outcomes: list[MarketOutcome]
     neg_risk_market_id: str = ""
+    event_slug: str = ""
 
 
 @dataclass
@@ -177,6 +178,7 @@ class PolymarketClient:
                 question=event.get("title", ""),
                 outcomes=outcomes,
                 neg_risk_market_id=neg_risk_market_id,
+                event_slug=event_slug,
             )
         except Exception as e:
             logger.error(f"Failed to get market by slug {event_slug}: {e}")

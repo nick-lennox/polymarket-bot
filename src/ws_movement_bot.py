@@ -8,6 +8,7 @@ Strategy:
 - Subscribe to order book updates for all market outcomes
 - Detect z-score spikes in real-time as orders flow in
 - Scale into position as conviction grows
+- On Monday, trade Fri + Sat + Sun markets with shared budget
 """
 
 import asyncio
@@ -15,11 +16,11 @@ import json
 import logging
 import signal
 import sys
-from datetime import datetime, time, date
+from datetime import datetime, time, date, timedelta
 from typing import Optional, Dict
+
 import pytz
-import websockets
-from websockets.asyncio.client import connect as ws_connect
+from websockets import connect as ws_connect
 from websockets.exceptions import ConnectionClosed, WebSocketException
 
 from .config import load_settings, print_config, Settings
@@ -27,35 +28,42 @@ from .polymarket import PolymarketClient, Market
 from .movement_detector import MovementDetector, MovementSignal, parse_scale_in_pcts
 
 logger = logging.getLogger(__name__)
-ET_TIMEZONE = pytz.timezone("America/New_York")
 
+ET_TIMEZONE = pytz.timezone("America/New_York")
 WS_MARKET_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-PING_INTERVAL = 10  # seconds
-RECONNECT_DELAY = 1  # initial delay, will exponential backoff
+PING_INTERVAL = 10
+RECONNECT_DELAY = 1
 MAX_RECONNECT_DELAY = 60
 
 
 class WebSocketMovementBot:
+    """Real-time movement bot using Polymarket WebSocket feed."""
+
     def __init__(self, settings: Settings):
         self.settings = settings
         self.polymarket: Optional[PolymarketClient] = None
         self.detector: Optional[MovementDetector] = None
         self._running = False
-        self._current_market: Optional[Market] = None
+        self._current_markets: list[Market] = []
+        self._market_detectors: Dict[str, MovementDetector] = {}
         self._budget_remaining = settings.max_trade_size_usd
-        self._ws: Optional[websockets.WebSocketClientProtocol] = None
-        self._token_id_to_outcome: Dict[str, str] = {}  # token_id -> outcome_name
+        self._ws = None
+        self._ws_should_run = False
+        self._token_id_to_outcome: Dict[str, str] = {}
+        self._token_id_to_slug: Dict[str, str] = {}
         self._update_count = 0
         self._last_signal_time: Optional[datetime] = None
 
     async def initialize(self):
+        """Connect to Polymarket and create reference detector."""
         logger.info("Initializing WebSocket Movement Trading Bot...")
         polymarket_config = self.settings.get_polymarket_config()
+
         if polymarket_config.private_key:
             self.polymarket = PolymarketClient(polymarket_config)
             try:
                 self.polymarket.connect()
-                logger.info("Connected to Polymarket API")
+                logger.info("Connected to Polymarket")
             except Exception as e:
                 logger.error(f"Failed to connect: {e}")
                 self.polymarket = None
@@ -69,9 +77,13 @@ class WebSocketMovementBot:
             max_buy_price=self.settings.max_buy_price,
             min_price_change=self.settings.min_price_change,
         )
-        logger.info(f"Detector configured: z-threshold={self.settings.zscore_threshold}, scale={scale_pcts}")
+        logger.info(
+            f"Detector configured: z-threshold={self.settings.zscore_threshold}, "
+            f"scale={scale_pcts}"
+        )
 
     def _in_monitor_window(self) -> bool:
+        """Check if current time is within the ET monitoring window."""
         now_et = datetime.now(ET_TIMEZONE)
         is_weekday = now_et.weekday() < 5
         start = time(self.settings.monitor_window_start_hour, 0)
@@ -79,161 +91,252 @@ class WebSocketMovementBot:
         in_window = start <= now_et.time() <= end
         return is_weekday and in_window
 
-    async def _discover_market(self) -> Optional[Market]:
+    def _discover_tsa_slugs(self, target_date: date) -> list[str]:
+        """Build TSA market slugs for the given date.
+
+        On Monday (weekday 0), returns 3 slugs for Fri + Sat + Sun
+        because weekend data is released on Monday morning.
+        On other weekdays, returns only the previous day slug.
+        """
+        slugs: list[str] = []
+        weekday = target_date.weekday()
+
+        if weekday == 0:
+            # Monday: include Friday, Saturday, Sunday
+            for days_back in [3, 2, 1]:
+                d = target_date - timedelta(days=days_back)
+                month_name = d.strftime("%B").lower()
+                slugs.append(f"number-of-tsa-passengers-{month_name}-{d.day}")
+        else:
+            # Tuesday-Friday: previous day only
+            d = target_date - timedelta(days=1)
+            month_name = d.strftime("%B").lower()
+            slugs.append(f"number-of-tsa-passengers-{month_name}-{d.day}")
+
+        return slugs
+
+    async def _discover_markets(self) -> list[Market]:
+        """Discover and fetch markets with order books.
+
+        If target_market_slug is set, use it directly.
+        Otherwise, auto-discover TSA markets (multiple on Monday).
+        """
         if not self.polymarket:
-            return None
+            return []
+
         slug = self.settings.target_market_slug
-        if not slug:
-            slug = self.polymarket.discover_tsa_market(date.today())
-            if not slug:
-                logger.error("Could not auto-discover market")
-                return None
-            logger.info(f"Auto-discovered: {slug}")
-        return self.polymarket.get_market_with_books(slug)
+        if slug:
+            market = self.polymarket.get_market_with_books(slug)
+            if market:
+                market.event_slug = slug
+                return [market]
+            logger.error(f"Could not fetch target market: {slug}")
+            return []
 
-    def _execute_signal(self, signal: MovementSignal):
-        latency_ms = None
-        if self._last_signal_time:
-            latency_ms = (datetime.now() - self._last_signal_time).total_seconds() * 1000
-        self._last_signal_time = datetime.now()
+        # Auto-discover based on date
+        today = date.today()
+        slugs = self._discover_tsa_slugs(today)
+        logger.info(f"Auto-discovered {len(slugs)} market slug(s): {slugs}")
 
-        if not self.polymarket:
-            logger.info(f"[DRY] Would buy {signal.outcome_name} @ ${signal.current_price:.4f}" +
-                       (f" (latency: {latency_ms:.0f}ms)" if latency_ms else ""))
+        markets: list[Market] = []
+        for s in slugs:
+            # Parse date from slug to verify via discover_tsa_market
+            date_part = s.replace("number-of-tsa-passengers-", "")
+            try:
+                parsed = datetime.strptime(date_part, "%B-%d")
+                check_date = parsed.replace(year=today.year).date()
+            except ValueError:
+                logger.warning(f"Could not parse date from slug: {s}")
+                continue
+
+            verified = self.polymarket.discover_tsa_market(check_date)
+            if not verified:
+                logger.warning(f"Market not found for slug: {s}")
+                continue
+
+            market = self.polymarket.get_market_with_books(verified)
+            if market:
+                market.event_slug = verified
+                markets.append(market)
+                logger.info(
+                    f"Market: {market.question} ({len(market.outcomes)} outcomes)"
+                )
+
+        if not markets:
+            logger.error("Could not discover any TSA markets")
+
+        return markets
+
+    def _execute_signal(self, sig: MovementSignal):
+        """Execute a trading signal (or log in dry-run mode)."""
+        latency_ms = (
+            (datetime.now() - sig.timestamp).total_seconds() * 1000
+            if sig.timestamp
+            else 0.0
+        )
+        logger.info(
+            f"SIGNAL: {sig.outcome_name} z={sig.zscore:.2f} "
+            f"price={sig.baseline_price:.4f}->{sig.current_price:.4f} "
+            f"(+{sig.price_change:.4f}, +{sig.price_change_pct:.1f}%) "
+            f"trigger #{sig.trigger_number} -> {sig.budget_pct}% budget "
+            f"[latency={latency_ms:.0f}ms]"
+        )
+
+        if self.settings.dry_run or not self.polymarket:
+            logger.info(
+                f"[DRY] Would buy {sig.outcome_name} @ ${sig.current_price:.4f}"
+            )
             return
 
-        alloc_pct = signal.budget_pct / 100
+        alloc_pct = sig.budget_pct / 100
         amount = min(self._budget_remaining * alloc_pct, self._budget_remaining)
         if amount < 1.0:
-            logger.info("Budget exhausted")
+            logger.info("Budget exhausted - skipping trade")
             return
 
-        logger.info(f"EXECUTE: BUY ${amount:.2f} of {signal.outcome_name} @ ${signal.current_price:.4f}")
+        logger.info(
+            f"EXECUTE: BUY ${amount:.2f} of {sig.outcome_name} "
+            f"@ ${sig.current_price:.4f}"
+        )
         result = self.polymarket.buy_market_order(
-            token_id=signal.token_id,
+            token_id=sig.token_id,
             amount_usd=amount,
-            dry_run=self.settings.dry_run
+            dry_run=self.settings.dry_run,
         )
         if result.success:
             self._budget_remaining -= amount
-            logger.info(f"SUCCESS: {result.order_id} - budget remaining: ${self._budget_remaining:.2f}")
+            self._last_signal_time = datetime.now(ET_TIMEZONE)
+            logger.info(
+                f"SUCCESS: {result.order_id} - "
+                f"budget remaining: ${self._budget_remaining:.2f}"
+            )
         else:
             logger.error(f"FAILED: {result.error}")
 
     def _process_book_update(self, data: dict):
-        """Process a WebSocket order book update."""
-        asset_id = data.get("asset_id")
-        if not asset_id or asset_id not in self._token_id_to_outcome:
+        """Process a single order book update from the WebSocket feed."""
+        asset_id = data.get("market") or data.get("asset_id")
+        if not asset_id:
             return
 
-        outcome_name = self._token_id_to_outcome[asset_id]
-        asks = data.get("asks", [])
+        outcome_name = self._token_id_to_outcome.get(asset_id)
+        slug = self._token_id_to_slug.get(asset_id)
+        if not outcome_name or not slug:
+            return
 
+        # Parse best ask from the asks array
+        asks = data.get("asks", [])
         if not asks:
             return
 
-        # Get best ask price
         try:
-            best_ask = float(asks[0]["price"])
-        except (IndexError, KeyError, ValueError):
+            first_ask = asks[0]
+            if isinstance(first_ask, dict):
+                best_ask = float(first_ask.get("price", first_ask.get("p", 0)))
+            elif hasattr(first_ask, "price"):
+                best_ask = float(first_ask.price)
+            else:
+                best_ask = float(first_ask[0])
+        except (IndexError, TypeError, ValueError):
+            return
+
+        if best_ask <= 0:
             return
 
         self._update_count += 1
 
-        # Update detector with new price
-        if outcome_name in self.detector.outcomes:
-            state = self.detector.outcomes[outcome_name]
-            state.update_price(best_ask, datetime.now())
+        detector = self._market_detectors.get(slug)
+        if not detector:
+            return
 
-            # Check for trigger
-            signal = self.detector._check_trigger(state)
-            if signal:
-                self.detector.total_signals += 1
-                self._execute_signal(signal)
+        state = detector.outcomes.get(outcome_name)
+        if not state:
+            return
 
-        # Log periodic status
-        if self._update_count % 100 == 0:
-            logger.debug(f"Processed {self._update_count} order book updates")
+        state.update_price(best_ask, datetime.now())
+        sig = detector._check_trigger(state)
+        if sig:
+            detector.total_signals += 1
+            self._execute_signal(sig)
 
     async def _ping_loop(self):
-        """Send periodic pings to keep connection alive."""
-        while self._running and self._ws:
+        """Send periodic pings to keep the WebSocket alive."""
+        while self._ws_should_run and self._ws:
             try:
                 await asyncio.sleep(PING_INTERVAL)
-                if self._ws:
-                    await self._ws.ping()
+                if self._ws and self._ws_should_run:
+                    pong = await self._ws.ping()
+                    await asyncio.wait_for(pong, timeout=PING_INTERVAL)
+            except asyncio.TimeoutError:
+                logger.warning("Ping pong timeout - connection may be stale")
+                break
             except Exception as e:
-                logger.debug(f"Ping failed: {e}")
+                logger.debug(f"Ping loop error: {e}")
                 break
 
-    async def _subscribe_to_market(self, ws, market: Market):
+    async def _subscribe_to_markets(self, ws, markets: list[Market]):
         """Subscribe to order book updates for all market outcomes."""
-        token_ids = []
         self._token_id_to_outcome.clear()
+        self._token_id_to_slug.clear()
+        all_token_ids: list[str] = []
 
-        for outcome in market.outcomes:
-            token_ids.append(outcome.token_id)
-            self._token_id_to_outcome[outcome.token_id] = outcome.outcome
-            logger.info(f"  Subscribing: {outcome.outcome} ({outcome.token_id[:16]}...)")
+        for market in markets:
+            slug = getattr(market, "event_slug", market.condition_id)
+            for outcome in market.outcomes:
+                if outcome.token_id:
+                    self._token_id_to_outcome[outcome.token_id] = outcome.outcome
+                    self._token_id_to_slug[outcome.token_id] = slug
+                    all_token_ids.append(outcome.token_id)
+
+        if not all_token_ids:
+            logger.warning("No token IDs to subscribe to")
+            return
 
         subscription = {
+            "auth": {},
             "type": "market",
-            "assets_ids": token_ids
+            "assets_ids": all_token_ids,
         }
         await ws.send(json.dumps(subscription))
-        logger.info(f"Subscribed to {len(token_ids)} token order books")
+        logger.info(
+            f"Subscribed to {len(all_token_ids)} token(s) across "
+            f"{len(markets)} market(s)"
+        )
 
     async def _run_websocket(self):
-        """Main WebSocket connection and message loop."""
-        reconnect_delay = RECONNECT_DELAY
+        """Main WebSocket connection loop with reconnection logic."""
+        delay = RECONNECT_DELAY
 
-        while self._running and getattr(self, '_ws_should_run', True):
+        while self._ws_should_run:
             try:
                 logger.info(f"Connecting to WebSocket: {WS_MARKET_URL}")
                 async with ws_connect(
                     WS_MARKET_URL,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    close_timeout=5,
+                    ping_interval=None,
+                    max_size=4 * 1024 * 1024,
                 ) as ws:
                     self._ws = ws
-                    reconnect_delay = RECONNECT_DELAY  # Reset on successful connect
-                    logger.info("WebSocket connected!")
+                    delay = RECONNECT_DELAY
+                    logger.info("WebSocket connected")
 
-                    # Subscribe to market
-                    if self._current_market:
-                        await self._subscribe_to_market(ws, self._current_market)
+                    await self._subscribe_to_markets(ws, self._current_markets)
 
-                    # Start ping loop
                     ping_task = asyncio.create_task(self._ping_loop())
-
                     try:
-                        async for message in ws:
-                            if not self._running:
+                        async for raw_message in ws:
+                            if not self._ws_should_run:
                                 break
-
                             try:
-                                data = json.loads(message)
-
-                                # Handle both single objects and arrays of updates
-                                updates = data if isinstance(data, list) else [data]
-
-                                for update in updates:
-                                    if not isinstance(update, dict):
-                                        continue
-                                    event_type = update.get("event_type")
-
-                                    if event_type == "book":
-                                        self._process_book_update(update)
-                                    elif event_type == "price_change":
-                                        # Could also use these for faster detection
-                                        pass
-
+                                message = json.loads(raw_message)
                             except json.JSONDecodeError:
-                                logger.warning(f"Invalid JSON: {message[:100]}")
-                            except Exception as e:
-                                logger.error(f"Error processing message: {e}", exc_info=True)
+                                continue
 
+                            if isinstance(message, list):
+                                for item in message:
+                                    if isinstance(item, dict):
+                                        self._process_book_update(item)
+                            elif isinstance(message, dict):
+                                self._process_book_update(message)
                     finally:
                         ping_task.cancel()
                         try:
@@ -242,78 +345,135 @@ class WebSocketMovementBot:
                             pass
 
             except ConnectionClosed as e:
-                logger.warning(f"WebSocket closed: {e}")
+                logger.warning(f"WebSocket connection closed: {e}")
             except WebSocketException as e:
                 logger.error(f"WebSocket error: {e}")
+            except asyncio.CancelledError:
+                logger.info("WebSocket task cancelled")
+                break
             except Exception as e:
-                logger.error(f"Unexpected error: {e}", exc_info=True)
+                logger.error(f"Unexpected WebSocket error: {e}", exc_info=True)
+            finally:
+                self._ws = None
 
-            self._ws = None
-
-            if self._running and getattr(self, '_ws_should_run', True):
-                logger.info(f"Reconnecting in {reconnect_delay}s...")
-                await asyncio.sleep(reconnect_delay)
-                reconnect_delay = min(reconnect_delay * 2, MAX_RECONNECT_DELAY)
+            if self._ws_should_run:
+                logger.info(f"Reconnecting in {delay}s...")
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, MAX_RECONNECT_DELAY)
 
     async def run(self):
+        """Main bot loop: discover markets, connect WS, monitor movements."""
         self._running = True
         logger.info("Starting WebSocket Movement Bot")
-        logger.info(f"  Monitor window: {self.settings.monitor_window_start_hour}:00 - {self.settings.monitor_window_end_hour}:00 ET")
+        logger.info(
+            f"  Monitor window: {self.settings.monitor_window_start_hour}:00 - "
+            f"{self.settings.monitor_window_end_hour}:00 ET"
+        )
         logger.info(f"  Z-score threshold: {self.settings.zscore_threshold}")
         logger.info(f"  Budget: ${self.settings.max_trade_size_usd}")
         logger.info(f"  Dry run: {self.settings.dry_run}")
-        logger.info(f"  Mode: WEBSOCKET (real-time)")
 
         was_in_window = False
+        ws_task: Optional[asyncio.Task] = None
 
         while self._running:
             try:
                 in_window = self._in_monitor_window()
 
-                # Window just started
+                # === Window just started ===
                 if in_window and not was_in_window:
                     logger.info("=== MONITOR WINDOW STARTED ===")
                     self._budget_remaining = self.settings.max_trade_size_usd
-                    self.detector.reset()
                     self._update_count = 0
-                    self._ws_should_run = True  # Flag to control WebSocket loop
+                    self._last_signal_time = None
+                    self._market_detectors.clear()
 
-                    self._current_market = await self._discover_market()
-                    if self._current_market:
-                        logger.info(f"Market: {self._current_market.question}")
-                        self.detector.set_baseline(self._current_market.outcomes)
+                    self._current_markets = await self._discover_markets()
+                    if self._current_markets:
+                        scale_pcts = parse_scale_in_pcts(
+                            self.settings.scale_in_pcts
+                        )
+                        for market in self._current_markets:
+                            slug = getattr(
+                                market, "event_slug", market.condition_id
+                            )
+                            det = MovementDetector(
+                                zscore_threshold=self.settings.zscore_threshold,
+                                scale_in_pcts=scale_pcts,
+                                max_buy_price=self.settings.max_buy_price,
+                                min_price_change=self.settings.min_price_change,
+                            )
+                            det.set_baseline(market.outcomes)
+                            self._market_detectors[slug] = det
+                            logger.info(
+                                f"Detector for [{slug}]: "
+                                f"{len(market.outcomes)} outcomes baselined"
+                            )
 
-                        # Run WebSocket until window ends
+                        # Launch WebSocket
+                        self._ws_should_run = True
                         ws_task = asyncio.create_task(self._run_websocket())
+                        logger.info("WebSocket feed started")
 
-                        # Wait for window to end
-                        while self._running and self._in_monitor_window():
-                            await asyncio.sleep(1)
-
-                        # Stop WebSocket - set flag first to prevent reconnects
-                        logger.info("Window ending, stopping WebSocket...")
-                        self._ws_should_run = False
-                        if self._ws:
-                            await self._ws.close()
+                # === Window just ended ===
+                if not in_window and was_in_window:
+                    logger.info("=== MONITOR WINDOW ENDED ===")
+                    self._ws_should_run = False
+                    if self._ws:
+                        await self._ws.close()
+                    if ws_task and not ws_task.done():
                         ws_task.cancel()
                         try:
                             await ws_task
                         except asyncio.CancelledError:
                             pass
-                        logger.info("WebSocket stopped")
+                    ws_task = None
+                    self._ws = None
 
-                # Window just ended
-                if not in_window and was_in_window:
-                    logger.info("=== MONITOR WINDOW ENDED ===")
-                    status = self.detector.get_status()
-                    logger.info(f"Session summary: {status['total_signals']} signals, "
-                               f"{status['budget_spent_pct']}% budget used, "
-                               f"{self._update_count} WS updates processed")
+                    total_signals = sum(
+                        d.total_signals
+                        for d in self._market_detectors.values()
+                    )
+                    budget_used = (
+                        self.settings.max_trade_size_usd
+                        - self._budget_remaining
+                    )
+                    budget_pct = (
+                        budget_used / self.settings.max_trade_size_usd * 100
+                        if self.settings.max_trade_size_usd > 0
+                        else 0.0
+                    )
+                    logger.info(
+                        f"Session summary: {total_signals} signals, "
+                        f"{budget_pct:.1f}% budget used, "
+                        f"{self._update_count} WS updates processed"
+                    )
+                    self._current_markets.clear()
+                    self._market_detectors.clear()
 
                 was_in_window = in_window
 
-                # Outside window, just wait
-                if not in_window:
+                # Budget exhaustion check
+                if in_window and self._budget_remaining < 1.0:
+                    if self._ws_should_run:
+                        logger.info(
+                            "Budget exhausted - stopping WebSocket early"
+                        )
+                        self._ws_should_run = False
+                        if self._ws:
+                            await self._ws.close()
+                        if ws_task and not ws_task.done():
+                            ws_task.cancel()
+                            try:
+                                await ws_task
+                            except asyncio.CancelledError:
+                                pass
+                            ws_task = None
+
+                # Sleep between checks
+                if in_window:
+                    await asyncio.sleep(1)
+                else:
                     await asyncio.sleep(30)
 
             except Exception as e:
@@ -321,33 +481,40 @@ class WebSocketMovementBot:
                 await asyncio.sleep(5)
 
     def stop(self):
+        """Signal the bot to stop gracefully."""
         logger.info("Stopping bot...")
         self._running = False
+        self._ws_should_run = False
 
 
 class ETFormatter(logging.Formatter):
-    """Formatter that converts timestamps to Eastern Time."""
+    """Log formatter that displays timestamps in Eastern Time."""
+
     def formatTime(self, record, datefmt=None):
-        dt = datetime.fromtimestamp(record.created, tz=ET_TIMEZONE)
+        utc_dt = datetime.fromtimestamp(record.created, tz=pytz.utc)
+        et_dt = utc_dt.astimezone(ET_TIMEZONE)
         if datefmt:
-            return dt.strftime(datefmt)
-        return dt.strftime("%Y-%m-%d %H:%M:%S")
+            return et_dt.strftime(datefmt)
+        return et_dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def setup_logging(level: str = "INFO"):
-    """Configure logging for the bot with ET timestamps."""
-    handler = logging.StreamHandler()
-    handler.setFormatter(ETFormatter(
-        fmt="%(asctime)s ET | %(levelname)-8s | %(name)s | %(message)s",
+    """Configure logging with ET timestamps."""
+    formatter = ETFormatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-    ))
-    logging.root.handlers = []
-    logging.root.addHandler(handler)
-    logging.root.setLevel(getattr(logging, level.upper(), logging.INFO))
+    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(getattr(logging, level.upper(), logging.INFO))
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+
     # Quiet noisy libraries
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("websockets").setLevel(logging.WARNING)
+    for lib in ("httpx", "httpcore", "websockets", "urllib3"):
+        logging.getLogger(lib).setLevel(logging.WARNING)
 
 
 async def main():
@@ -362,7 +529,7 @@ async def main():
 
     bot = WebSocketMovementBot(settings)
 
-    # Signal handlers (Unix only)
+    # Signal handlers (Unix only - works in Docker/Linux)
     try:
         loop = asyncio.get_event_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
