@@ -52,6 +52,7 @@ class WebSocketMovementBot:
         self._token_id_to_outcome: Dict[str, str] = {}
         self._token_id_to_slug: Dict[str, str] = {}
         self._update_count = 0
+        self._dropped_count = 0
         self._last_signal_time: Optional[datetime] = None
 
     async def initialize(self):
@@ -213,9 +214,27 @@ class WebSocketMovementBot:
         else:
             logger.error(f"FAILED: {result.error}")
 
-    def _process_book_update(self, data: dict):
-        """Process a single order book update from the WebSocket feed."""
-        asset_id = data.get("market") or data.get("asset_id")
+    def _process_message(self, data: dict):
+        """Process a WebSocket message (book or price_change event)."""
+        event_type = data.get("event_type", "")
+
+        if event_type == "book":
+            self._process_book_event(data)
+        elif event_type == "price_change":
+            self._process_price_change(data)
+        elif event_type == "last_trade_price":
+            pass  # Not used for detection
+        else:
+            self._dropped_count += 1
+            if self._dropped_count <= 5:
+                logger.debug(
+                    f"Unknown event_type={event_type!r}, "
+                    f"keys={list(data.keys())[:8]}"
+                )
+
+    def _process_book_event(self, data: dict):
+        """Process a full order book snapshot (event_type=book)."""
+        asset_id = data.get("asset_id") or data.get("market")
         if not asset_id:
             return
 
@@ -224,7 +243,6 @@ class WebSocketMovementBot:
         if not outcome_name or not slug:
             return
 
-        # Parse best ask from the asks array
         asks = data.get("asks", [])
         if not asks:
             return
@@ -233,10 +251,8 @@ class WebSocketMovementBot:
             first_ask = asks[0]
             if isinstance(first_ask, dict):
                 best_ask = float(first_ask.get("price", first_ask.get("p", 0)))
-            elif hasattr(first_ask, "price"):
-                best_ask = float(first_ask.price)
             else:
-                best_ask = float(first_ask[0])
+                best_ask = float(first_ask)
         except (IndexError, TypeError, ValueError):
             return
 
@@ -244,7 +260,55 @@ class WebSocketMovementBot:
             return
 
         self._update_count += 1
+        self._feed_price_to_detector(asset_id, outcome_name, slug, best_ask)
 
+    def _process_price_change(self, data: dict):
+        """Process an incremental price change (event_type=price_change)."""
+        # price_change can have asset_id at top level with price+side
+        asset_id = data.get("asset_id") or data.get("market")
+        side = data.get("side", "")
+        price_str = data.get("price")
+
+        if asset_id and price_str and side.upper() == "ASK":
+            outcome_name = self._token_id_to_outcome.get(asset_id)
+            slug = self._token_id_to_slug.get(asset_id)
+            if outcome_name and slug:
+                try:
+                    price = float(price_str)
+                except (ValueError, TypeError):
+                    return
+                if price > 0:
+                    self._update_count += 1
+                    self._feed_price_to_detector(
+                        asset_id, outcome_name, slug, price
+                    )
+                    return
+
+        # Also handle nested price_changes array format
+        changes = data.get("price_changes", [])
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+            aid = change.get("asset_id", "")
+            best_ask_str = change.get("best_ask")
+            if not aid or not best_ask_str:
+                continue
+            outcome_name = self._token_id_to_outcome.get(aid)
+            slug = self._token_id_to_slug.get(aid)
+            if not outcome_name or not slug:
+                continue
+            try:
+                best_ask = float(best_ask_str)
+            except (ValueError, TypeError):
+                continue
+            if best_ask > 0:
+                self._update_count += 1
+                self._feed_price_to_detector(aid, outcome_name, slug, best_ask)
+
+    def _feed_price_to_detector(
+        self, asset_id: str, outcome_name: str, slug: str, price: float
+    ):
+        """Feed a price update to the appropriate market detector."""
         detector = self._market_detectors.get(slug)
         if not detector:
             return
@@ -253,7 +317,7 @@ class WebSocketMovementBot:
         if not state:
             return
 
-        state.update_price(best_ask, datetime.now())
+        state.update_price(price, datetime.now())
         sig = detector._check_trigger(state)
         if sig:
             detector.total_signals += 1
@@ -302,6 +366,10 @@ class WebSocketMovementBot:
             f"Subscribed to {len(all_token_ids)} token(s) across "
             f"{len(markets)} market(s)"
         )
+        # Log token mappings for diagnostics
+        for tid, name in self._token_id_to_outcome.items():
+            slug = self._token_id_to_slug.get(tid, "?")
+            logger.debug(f"  Token {tid[:20]}... -> {name} [{slug}]")
 
     async def _run_websocket(self):
         """Main WebSocket connection loop with reconnection logic."""
@@ -331,12 +399,17 @@ class WebSocketMovementBot:
                             except json.JSONDecodeError:
                                 continue
 
+                            # Log first few messages for diagnostics
+                            if self._update_count == 0 and self._dropped_count < 3:
+                                raw_preview = str(raw_message)[:200]
+                                logger.info(f"WS msg sample: {raw_preview}")
+
                             if isinstance(message, list):
                                 for item in message:
                                     if isinstance(item, dict):
-                                        self._process_book_update(item)
+                                        self._process_message(item)
                             elif isinstance(message, dict):
-                                self._process_book_update(message)
+                                self._process_message(message)
                     finally:
                         ping_task.cancel()
                         try:
@@ -385,6 +458,7 @@ class WebSocketMovementBot:
                     logger.info("=== MONITOR WINDOW STARTED ===")
                     self._budget_remaining = self.settings.max_trade_size_usd
                     self._update_count = 0
+                    self._dropped_count = 0
                     self._last_signal_time = None
                     self._market_detectors.clear()
 
@@ -446,7 +520,8 @@ class WebSocketMovementBot:
                     logger.info(
                         f"Session summary: {total_signals} signals, "
                         f"{budget_pct:.1f}% budget used, "
-                        f"{self._update_count} WS updates processed"
+                        f"{self._update_count} WS updates processed, "
+                        f"{self._dropped_count} unknown events dropped"
                     )
                     self._current_markets.clear()
                     self._market_detectors.clear()

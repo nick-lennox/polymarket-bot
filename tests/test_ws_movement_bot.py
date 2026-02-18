@@ -78,7 +78,7 @@ class TestProcessBookUpdate:
             "bids": [{"price": "0.24", "size": "50"}],
         }
 
-        bot._process_book_update(data)
+        bot._process_message(data)
         assert bot._update_count == 1
         state_mock.update_price.assert_called_once()
 
@@ -112,7 +112,7 @@ class TestProcessBookUpdate:
         }
 
         # Send update for Friday's token
-        bot._process_book_update({
+        bot._process_message({
             "event_type": "book",
             "asset_id": "token_fri",
             "asks": [{"price": "0.30", "size": "100"}],
@@ -133,7 +133,7 @@ class TestProcessBookUpdate:
             "asks": [{"price": "0.25", "size": "100"}],
         }
 
-        bot._process_book_update(data)
+        bot._process_message(data)
         assert bot._update_count == 0
 
     def test_handles_empty_asks(self):
@@ -145,7 +145,7 @@ class TestProcessBookUpdate:
             "asks": [],
         }
 
-        bot._process_book_update(data)
+        bot._process_message(data)
         assert bot._update_count == 0
 
 
@@ -195,7 +195,7 @@ class TestMessageParsing:
 
         for update in updates:
             if isinstance(update, dict) and update.get("event_type") == "book":
-                bot._process_book_update(update)
+                bot._process_message(update)
 
         # Should have processed both updates
         assert bot._update_count == 2
@@ -219,7 +219,7 @@ class TestMessageParsing:
 
         for update in updates:
             if isinstance(update, dict) and update.get("event_type") == "book":
-                bot._process_book_update(update)
+                bot._process_message(update)
 
         assert bot._update_count == 1
 
@@ -246,10 +246,103 @@ class TestMessageParsing:
         # Should not raise
         for update in updates:
             if isinstance(update, dict) and update.get("event_type") == "book":
-                bot._process_book_update(update)
+                bot._process_message(update)
 
         assert bot._update_count == 0  # No valid tokens
 
+
+
+class TestPriceChangeEvents:
+    """Tests for price_change event handling."""
+
+    def _setup_bot(self):
+        settings = create_mock_settings()
+        bot = WebSocketMovementBot(settings)
+
+        detector = MagicMock()
+        state_mock = MagicMock()
+        detector.outcomes = {"Test Outcome": state_mock}
+        detector._check_trigger.return_value = None
+
+        bot._market_detectors = {"test-slug": detector}
+        bot._token_id_to_outcome = {"token123": "Test Outcome"}
+        bot._token_id_to_slug = {"token123": "test-slug"}
+
+        return bot, state_mock
+
+    def test_handles_ask_price_change(self):
+        """price_change with side=ASK should update the price."""
+        bot, state_mock = self._setup_bot()
+
+        bot._process_message({
+            "event_type": "price_change",
+            "asset_id": "token123",
+            "price": "0.35",
+            "side": "ASK",
+        })
+
+        assert bot._update_count == 1
+        state_mock.update_price.assert_called_once()
+        call_args = state_mock.update_price.call_args[0]
+        assert call_args[0] == 0.35
+
+    def test_ignores_bid_price_change(self):
+        """price_change with side=BID should be ignored (we track asks)."""
+        bot, state_mock = self._setup_bot()
+
+        bot._process_message({
+            "event_type": "price_change",
+            "asset_id": "token123",
+            "price": "0.35",
+            "side": "BID",
+        })
+
+        assert bot._update_count == 0
+        state_mock.update_price.assert_not_called()
+
+    def test_handles_nested_price_changes(self):
+        """price_change with nested price_changes array."""
+        bot, state_mock = self._setup_bot()
+
+        bot._process_message({
+            "event_type": "price_change",
+            "market": "0xcondition123",
+            "price_changes": [
+                {
+                    "asset_id": "token123",
+                    "best_bid": "0.30",
+                    "best_ask": "0.35",
+                },
+            ],
+        })
+
+        assert bot._update_count == 1
+        state_mock.update_price.assert_called_once()
+
+    def test_last_trade_price_is_ignored(self):
+        """last_trade_price events should not update anything."""
+        bot, state_mock = self._setup_bot()
+
+        bot._process_message({
+            "event_type": "last_trade_price",
+            "asset_id": "token123",
+            "price": "0.35",
+        })
+
+        assert bot._update_count == 0
+        state_mock.update_price.assert_not_called()
+
+    def test_unknown_event_type_increments_dropped(self):
+        """Unknown event types should increment dropped count."""
+        bot, _ = self._setup_bot()
+
+        bot._process_message({
+            "event_type": "something_weird",
+            "data": "whatever",
+        })
+
+        assert bot._dropped_count == 1
+        assert bot._update_count == 0
 
 class TestBotStop:
     def test_stop(self):
