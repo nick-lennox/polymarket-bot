@@ -96,6 +96,7 @@ class MovementDetector:
         self.window_start = None
         self.total_signals = 0
         self.budget_spent_pct = 0.0
+        self._locked_outcome: Optional[str] = None  # Once one outcome triggers, lock to it
         
     def reset(self):
         self.outcomes.clear()
@@ -103,6 +104,7 @@ class MovementDetector:
         self.window_start = None
         self.total_signals = 0
         self.budget_spent_pct = 0.0
+        self._locked_outcome = None
         logger.info("MovementDetector reset")
     
     def set_baseline(self, market_outcomes):
@@ -120,10 +122,18 @@ class MovementDetector:
             self.outcomes[outcome.outcome] = state
     
     def update_prices(self, market_outcomes):
+        """Update prices for all outcomes but only signal on the top mover.
+
+        TSA markets have multiple brackets (e.g. 2.0M-2.2M, 2.2M-2.4M, etc).
+        When data drops, the winning bracket surges while others fall.
+        We only want to buy the single outcome with the highest z-score,
+        not scatter budget across multiple brackets.
+        """
         if not self.baseline_set:
             return []
-        signals = []
+
         now = datetime.now()
+        # First pass: update all prices
         for outcome in market_outcomes:
             if outcome.outcome not in self.outcomes:
                 continue
@@ -132,7 +142,20 @@ class MovementDetector:
             if best_ask is None:
                 continue
             state.update_price(best_ask, now)
-            signal = self._check_trigger(state)
+
+        # Second pass: find the outcome with the highest z-score
+        best_state = None
+        best_zscore = 0.0
+        for name, state in self.outcomes.items():
+            zscore = state.get_zscore()
+            if zscore is not None and zscore > best_zscore:
+                best_zscore = zscore
+                best_state = state
+
+        # Only trigger on the single best outcome
+        signals = []
+        if best_state:
+            signal = self._check_trigger(best_state)
             if signal:
                 signals.append(signal)
                 self.total_signals += 1
@@ -148,6 +171,9 @@ class MovementDetector:
         if state.current_price > self.max_buy_price:
             logger.info(f"  {state.outcome_name}: z={zscore:.2f} but price {state.current_price:.4f} > max")
             return None
+        # Once one outcome triggers, only allow that same outcome
+        if self._locked_outcome is not None and self._locked_outcome != state.outcome_name:
+            return None
         trigger_num = state.trigger_count + 1
         if trigger_num > len(self.scale_in_pcts):
             return None
@@ -155,8 +181,12 @@ class MovementDetector:
         state.triggered = True
         state.trigger_count = trigger_num
         self.budget_spent_pct += budget_pct
+        if self._locked_outcome is None:
+            self._locked_outcome = state.outcome_name
+            logger.info(f"  Locked to outcome: {state.outcome_name}")
         pct = (price_change / state.baseline_price * 100) if state.baseline_price > 0 else 0
-        logger.info(f"SIGNAL: {state.outcome_name} z={zscore:.2f} price={state.baseline_price:.4f}->{state.current_price:.4f} "
+        logger.info(f"SIGNAL: BUY YES {state.outcome_name} z={zscore:.2f} "
+                    f"price={state.baseline_price:.4f}->{state.current_price:.4f} "
                     f"(+{price_change:.4f}, +{pct:.1f}%) trigger #{trigger_num} -> {budget_pct}% budget")
         return MovementSignal(
             outcome_name=state.outcome_name, token_id=state.token_id, no_token_id=state.no_token_id,

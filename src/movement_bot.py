@@ -89,7 +89,7 @@ class MovementBot:
             market = self.polymarket.get_market_with_books(slug)
             if market:
                 markets.append(market)
-                logger.info(f"Loaded market: {market.question}")
+                logger.info(f"Loaded market: {market.question} (slug: {slug})")
 
         return markets
     
@@ -116,7 +116,7 @@ class MovementBot:
     
     def _execute_signal(self, signal: MovementSignal):
         if not self.polymarket:
-            logger.info(f"[DRY] Would buy {signal.outcome_name} @ ${signal.current_price:.4f}")
+            logger.info(f"[DRY] Would BUY YES {signal.outcome_name} @ ${signal.current_price:.4f}")
             return
         
         alloc_pct = signal.budget_pct / 100
@@ -125,7 +125,7 @@ class MovementBot:
             logger.info("Budget exhausted")
             return
         
-        logger.info(f"EXECUTE: BUY ${amount:.2f} of {signal.outcome_name} @ ${signal.current_price:.4f}")
+        logger.info(f"EXECUTE: BUY YES ${amount:.2f} on {signal.outcome_name} @ ${signal.current_price:.4f}")
         result = self.polymarket.buy_market_order(
             token_id=signal.token_id,
             amount_usd=amount,
